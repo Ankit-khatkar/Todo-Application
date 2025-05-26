@@ -1,0 +1,20 @@
+.inputfield {
+  padding: 12px 18px;
+  border: none;
+  border-radius: 8px;
+  background: #f4f6fb;
+  box-shadow: 0 2px 8px rgba(60, 72, 88, 0.08);
+  font-size: 1rem;
+  color: #22223b;
+  transition: box-shadow 0.2s, border 0.2s;
+  outline: none;
+  margin-bottom: 12px;
+
+  &:focus {
+    box-shadow: 0 4px 16px rgba(60, 72, 88, 0.16);
+    background: #fff;
+  }
+}
+.btn {
+  height: 10px;
+}
