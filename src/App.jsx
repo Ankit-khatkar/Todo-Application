@@ -3,6 +3,7 @@ import Mybtns from "./Components/Buttoncomps";
 import Items from "./Components/TodoItms";
 import Styles from "./App.module.css";
 import { useReducer, useState } from "react";
+import WelcomeMSG from "./Components/WelcomeMSG";
 import TodoItemsContext from "./store/todo-context-api";
 
 const todoItemReducer = (currTodoItems, action) => {
@@ -51,6 +52,7 @@ function App() {
         <div className="container text-center">
           <Mybtns></Mybtns>
           <Items></Items>
+          <WelcomeMSG></WelcomeMSG>
         </div>
       </center>
     </TodoItemsContext.Provider>

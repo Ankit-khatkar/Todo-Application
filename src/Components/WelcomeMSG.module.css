@@ -1,22 +1,10 @@
-.box {
-  justify-content: center;
-  align-items: center;
-  height: 50vh;
-  margin-top: 8.5rem;
-  border: 2px solid;
-  border-radius: 7px;
-  width: 50vw;
-  margin: auto;
-  margin-top: 150px;
-  box-sizing: border-box;
-  overflow: auto;
-
+.WelcomeMSG {
   color: #333;
-  font-size: 1rem;
+  font-size: 2rem;
   font-weight: bold;
   text-align: center;
   padding: 2rem 1rem;
-  background: linear-gradient(90deg, #f8ffae 0%, #43c6ac 100%);
+  /* background: linear-gradient(90deg, #f8ffae 0%, #43c6ac 100%);
   border-radius: 16px;
   box-shadow: 0 4px 16px rgba(67, 198, 172, 0.15);
   letter-spacing: 2px;
@@ -31,5 +19,5 @@
       opacity: 1;
       transform: translateY(0);
     }
-  }
+  } */
 }
