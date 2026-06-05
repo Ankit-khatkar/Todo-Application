@@ -4,7 +4,7 @@
 > **Type:** New feature (reverses a documented v1 constraint)
 > **Route:** `/dashboard/menu` (owner-only)
 > **Reference:** `phase2_owner_dashboard_plan.md`, `phase2_owner_dashboard_ux_ui.md`, `v2_deferred_issues.md` §1–§2, `CLAUDE.md`
-> **Migrations touched:** new `007_owner_menu_management.sql` (menu_items owner RLS + `restaurants.image_bucket` column + `storage.objects` policies)
+> **Migrations touched:** new `007_owner_menu_management.sql` (menu_items owner RLS + `storage.objects` folder-scoped policies). One shared `menu-images` bucket created once.
 
 ---
 
@@ -18,6 +18,8 @@ Let a restaurant owner manage their own menu from inside the app instead of wait
 4. **Mark a dish veg or non-veg.**
 5. **Enable / disable a dish** (out-of-stock toggle) — the operational fast-path during service.
 
+A core requirement that shaped the storage design: **when a new restaurant joins, its owner must be able to add dishes and upload images with zero admin intervention.** See §3 — this is why we consolidate to one shared bucket with per-restaurant folders.
+
 ### What this changes vs. v1
 
 `CLAUDE.md` and `redlotusfoods_documentation.md` §4.8 currently state: *"Owners cannot edit menu items in v1 (admin-managed via Supabase Dashboard)."* This feature **intentionally lifts that restriction** for the owner's *own* restaurant. The admin-managed path (`menu_items_admin_all`) stays exactly as-is; we only **add** owner write access scoped by RLS.
@@ -26,7 +28,6 @@ Let a restaurant owner manage their own menu from inside the app instead of wait
 
 - **Menu categories / sections** — flat menu stays (v1 rule; `RestaurantMenu.tsx` renders a flat list).
 - **Hard delete of dishes** — see §2.2. The out-of-stock toggle is the v1 "remove from menu" mechanism.
-- **Storage re-architecture** — the existing one-bucket-per-restaurant layout is kept as-is (see §3). Consolidating into a single shared bucket with per-restaurant folders is a possible v2 cleanup, noted in §11.
 - **Bulk import / CSV, drag-to-reorder, price scheduling, multi-image galleries.**
 - **Realtime menu propagation to live customer tabs** — customers pick up menu changes on their next page load (§7).
 
@@ -45,7 +46,7 @@ Everything the feature needs already exists on `menu_items` (migration 001):
 | `is_veg` | `boolean NOT NULL` | No default — **must** be supplied on insert. |
 | `is_available` | `boolean NOT NULL DEFAULT true` | The enable/disable toggle. |
 | `updated_at` | `timestamptz` | Auto-bumped by `set_menu_items_updated_at` trigger (003) on every UPDATE. |
-| `restaurant_id` | `uuid NOT NULL REFERENCES restaurants ON DELETE CASCADE` | Ownership anchor for RLS. |
+| `restaurant_id` | `uuid NOT NULL REFERENCES restaurants ON DELETE CASCADE` | Ownership anchor for RLS **and** the image folder name. |
 
 Two existing safeguards make the **disable** action a complete kill-switch with zero new code:
 
@@ -98,136 +99,111 @@ CREATE POLICY menu_items_owner_update ON public.menu_items
 
 ---
 
-## 3. Image Upload — Supabase Storage (one bucket per restaurant)
+## 3. Image Upload — Single Shared Bucket + Per-Restaurant Folders
 
-### 3.0 Current setup (confirmed with Ankit)
+### 3.0 Why this model (and what we're moving away from)
 
-Storage is **already in production** — my earlier "no storage exists" assumption was wrong (the `picsum.photos` URLs in `seed.sql` are placeholder seed data, not the live onboarded data). The real layout:
+Storage is **already in production**, but not in the shape this feature wants. Today each restaurant has its **own** bucket, named after the restaurant (e.g. `Gudha Delight Menu`), images at the bucket root, public read, 120 KB limit, 8 buckets, **all admin-created via the Dashboard** (config is Dashboard-managed per `supabase/config.toml`; the `picsum.photos` URLs in `seed.sql` are placeholder seed data, not live data).
 
-- **One public bucket per restaurant**, named after the restaurant — e.g. `Gudha Delight Menu` (human name, **contains spaces**).
-- Images live at the **bucket root**, e.g. `specialcrispycorn.jpg`. No subfolders.
-- **Public read** (any visitor can view any menu image — the customer menu `<img>` needs this).
-- **120 KB** size limit per image.
-- 8 restaurants → 8 buckets, all **admin-created at onboarding** via the Dashboard.
-- Example URL: `https://umsqskeqmwbmvrfvyrbl.supabase.co/storage/v1/object/public/Gudha%20Delight%20Menu/specialcrispycorn.jpg`
+That model **cannot be self-serve for new restaurants**: bucket creation is a privileged (`service_role`) operation, and the human bucket names aren't machine-derivable — so every new restaurant would need an admin to create and name a bucket. (Full rationale in §11.)
 
-Config is Dashboard-managed (`supabase/config.toml` says so) — none of it is in the repo, which is why the bucket name/limit aren't discoverable from code.
+**Decision: consolidate to one shared, public bucket `menu-images`, with one folder per restaurant keyed by `restaurant_id`.** Supabase "folders" are just object-key prefixes — they are **not created**, they spring into existence on first upload. So a brand-new restaurant's owner can upload immediately with **no admin step, no `service_role`, no per-restaurant provisioning**. This directly satisfies the self-serve requirement in §0.
 
-**Decision:** keep this model. Leave existing images untouched. New owner uploads go into the *same* per-restaurant bucket. (One-bucket-per-restaurant has scaling quirks — bucket-count limits, a new bucket per onboarding — but re-architecting it is out of scope; see §11.)
+### 3.1 Bucket
 
-### 3.1 The RLS problem this model creates → `restaurants.image_bucket`
+| Setting | Value | Why |
+|---|---|---|
+| Bucket id | `menu-images` | Single shared bucket, created **once** for the whole platform. |
+| Public | **Yes** (public read) | Customer menu (`RestaurantMenu.tsx`) renders `<img src={image_url}>` with no auth context. |
+| Allowed MIME | `image/jpeg`, `image/png`, `image/webp` | Enforce in bucket config + client-side. |
+| File size limit | **120 KB** | Matches the existing constraint; client compresses to fit (§3.4). |
 
-Owner-write isolation must enforce *"owner X may write only to **their** restaurant's bucket."* But the bucket is identified by a human string (`Gudha Delight Menu`) that RLS cannot derive from `auth.uid()`, and there's no convention linking it to `restaurant_id`. We need an explicit mapping.
+### 3.2 Path convention
 
-**Add `restaurants.image_bucket text` and backfill the 8 existing rows** (007):
-
-```sql
--- ── restaurants: map each restaurant to its image bucket (007) ─
-ALTER TABLE public.restaurants ADD COLUMN image_bucket text;
-
--- Backfill the 8 existing restaurants with their actual bucket ids.
--- Bucket names are arbitrary human strings, so do this per row, e.g.:
--- UPDATE public.restaurants SET image_bucket = 'Gudha Delight Menu'
---   WHERE id = '<gudha-delight-restaurant-id>';
--- ... repeat for the other 7.
+```
+menu-images/{restaurant_id}/{menu_item_id}.{ext}
+            └── folder ───┘ └──── object ─────┘
 ```
 
-Going forward, onboarding sets `image_bucket` whenever Ankit creates the restaurant's bucket. The frontend fetches it with the restaurant row and uses it as the upload target (§5.4).
+- **First path segment is the `restaurant_id`** — this is what folder-scoped RLS keys ownership on, and it's machine-derivable (no human naming, no mapping column).
+- Naming the object after `menu_item_id` makes replace idempotent (overwrite the same key) and collision-proof.
+- The stored `menu_items.image_url` is the full public URL (+ cache-buster, §3.5).
 
-> **In a Supabase bucket created via the Dashboard, the bucket `id` equals its `name`** — so `image_bucket` stores `'Gudha Delight Menu'` and storage RLS matches it against `storage.objects.bucket_id` directly.
-
-### 3.2 Buckets are admin-created — owners only upload
-
-Creating a bucket needs `service_role` (Dashboard). **Owners never create buckets** — they upload into the bucket Ankit created at onboarding. The self-serve flow therefore assumes `restaurants.image_bucket` is already set. If it's `null`, the editor **disables image upload** and shows *"Image upload isn't set up yet — please contact admin."* (same human-fix philosophy as `OnboardingIncomplete`). The dish can still be added/edited text-only.
+> **No `restaurants.image_bucket` column** — the bucket is the constant `'menu-images'` and the folder is `restaurant_id`. Both are known from the row the page already has, so there's nothing to store or map.
 
 ### 3.3 Storage RLS (`storage.objects`)
 
-Public read (matches today's "anyone can view"); owner write only to their mapped bucket.
-
 ```sql
--- Public read for any menu bucket. (Public buckets already serve objects
--- over the public URL without RLS; this SELECT policy only governs the
--- authenticated list/download API — keep it permissive to match today.)
+-- Public read for the whole menu bucket.
 CREATE POLICY "menu_images_public_read" ON storage.objects
-  FOR SELECT USING (
-    bucket_id IN (SELECT image_bucket FROM public.restaurants
-                  WHERE image_bucket IS NOT NULL)
-  );
+  FOR SELECT USING (bucket_id = 'menu-images');
 
--- Owner may write only inside the bucket mapped to a restaurant they own.
+-- Owner may write only inside their own restaurant's folder.
+-- (storage.foldername(name))[1] = first path segment = restaurant_id.
 CREATE POLICY "menu_images_owner_insert" ON storage.objects
   FOR INSERT TO authenticated
   WITH CHECK (
-    EXISTS (SELECT 1 FROM public.restaurants r
-            WHERE r.owner_id = auth.uid()
-              AND r.image_bucket = storage.objects.bucket_id)
+    bucket_id = 'menu-images'
+    AND EXISTS (
+      SELECT 1 FROM public.restaurants r
+      WHERE r.owner_id = auth.uid()
+        AND r.id::text = (storage.foldername(name))[1]
+    )
   );
 
-CREATE POLICY "menu_images_owner_update" ON storage.objects   -- replace/upsert
+CREATE POLICY "menu_images_owner_update" ON storage.objects    -- replace/upsert
   FOR UPDATE TO authenticated
   USING (
-    EXISTS (SELECT 1 FROM public.restaurants r
-            WHERE r.owner_id = auth.uid()
-              AND r.image_bucket = storage.objects.bucket_id)
+    bucket_id = 'menu-images'
+    AND EXISTS (
+      SELECT 1 FROM public.restaurants r
+      WHERE r.owner_id = auth.uid()
+        AND r.id::text = (storage.foldername(name))[1]
+    )
   );
 
-CREATE POLICY "menu_images_owner_delete" ON storage.objects   -- remove image
+CREATE POLICY "menu_images_owner_delete" ON storage.objects    -- remove image
   FOR DELETE TO authenticated
   USING (
-    EXISTS (SELECT 1 FROM public.restaurants r
-            WHERE r.owner_id = auth.uid()
-              AND r.image_bucket = storage.objects.bucket_id)
+    bucket_id = 'menu-images'
+    AND EXISTS (
+      SELECT 1 FROM public.restaurants r
+      WHERE r.owner_id = auth.uid()
+        AND r.id::text = (storage.foldername(name))[1]
+    )
   );
 ```
 
-> These policies live on `storage.objects`. Put them in `007` for reproducibility (fresh environments otherwise silently lose owner upload ability), **and** verify against what's already configured in the Dashboard so you don't create conflicting policies on a bucket that already has some.
+> Put these in `007` for reproducibility. A new restaurant needs **nothing** here — the policies already cover any `restaurant_id` folder the moment that restaurant row exists.
 
-### 3.4 Path / file naming for NEW uploads
+### 3.4 Migrating the existing 8 (hybrid — zero-downtime, no rush)
 
-Existing files are arbitrary names at the bucket root (`specialcrispycorn.jpg`) — left as-is. For **new** owner uploads, name the object by `menu_item_id` so replace is idempotent and collisions are impossible:
+`menu_items.image_url` stores **full URLs**, and the old per-restaurant buckets remain public — so existing images keep rendering with no change. We do **not** have to migrate before shipping.
 
-```
-{image_bucket}/{menu_item_id}.{ext}      e.g.  Gudha Delight Menu/3f9c1a....webp
-```
+- **Default (hybrid):** Leave the 8 old buckets in place. All **new** owner uploads/replaces go to `menu-images/{restaurant_id}/…`; the row's `image_url` is rewritten to the new URL. Old images naturally age out as owners re-upload.
+- **Optional cleanup (later):** A one-off script (Node + `service_role`) copies each old object into `menu-images/{restaurant_id}/{menu_item_id}.{ext}`, rewrites `image_url`, then deletes the old buckets. Pure SQL can't move objects across buckets — it needs the Storage API. Not required for launch; do it when convenient to retire the old buckets.
 
-The bucket name has spaces — the JS client encodes them; `supabase.storage.from("Gudha Delight Menu")` works directly. The stored `image_url` is the full public URL (+ cache-buster, §3.6), consistent with how existing rows store full URLs.
+### 3.5 Compression (mandatory — 120 KB) & replace/remove
 
-### 3.5 120 KB limit → client-side compression is mandatory
-
-120 KB is small; a raw phone photo (2–5 MB) is rejected outright by the bucket limit. `ImageUploader` **must** compress before upload:
+120 KB is small; a raw phone photo (2–5 MB) is rejected by the bucket limit. `ImageUploader` **must** compress before upload:
 
 1. Downscale to a max longest edge (~800–1000 px is plenty for a menu thumbnail).
-2. Re-encode to **WebP** (best ratio; falls back to JPEG on old Safari) via a `<canvas>`.
+2. Re-encode to **WebP** (best ratio; JPEG fallback on old Safari) via `<canvas>`.
 3. **Iterate quality down** until the blob is **< ~115 KB** (headroom under 120 KB). If it can't get under even at minimum quality, reject: *"Couldn't compress this image under 120 KB — try a simpler or smaller photo."*
 
-Sketch in §5.4. This keeps the owner from hitting an opaque storage 413 and matches the constraint the bucket already enforces.
-
-### 3.6 Replace & remove
-
-- **Replace image:** `upload(path, blob, { upsert: true })` overwrites the same `{menu_item_id}.{ext}` key. Public URL is stable, so cache-bust `image_url` with `?v=${Date.parse(updated_at)}` (or `Date.now()`) so customers' browsers refetch.
-- **Remove image (keep dish):** set `image_url = null` and best-effort `remove([path])` the object (orphans are harmless/cheap if the delete fails).
+- **Replace:** `upload(path, blob, { upsert: true })` overwrites `{menu_item_id}.{ext}`; cache-bust `image_url` with `?v=${Date.parse(updated_at)}` so customers refetch.
+- **Remove (keep dish):** `image_url = null` + best-effort `remove([path])` (orphans are harmless if delete fails).
 
 ---
 
 ## 4. TypeScript Types
 
-`MenuItem` already exists in `src/types/models.ts` (29–40) with every field — **no menu model change**. Add the new column to the `Restaurant` interface:
-
-```ts
-// src/types/models.ts — Restaurant
-image_bucket: string | null;   // per-restaurant Storage bucket id; null = upload not set up
-```
-
-After applying 007, optionally regenerate generated types:
-
-```bash
-npx supabase gen types typescript --local > src/types/database.ts
-```
-
-Local write-DTO for the menu feature:
+`MenuItem` already exists in `src/types/models.ts` (29–40) with every field — **no model change of any kind** (no `image_bucket`, since the bucket is a constant). Local write-DTO:
 
 ```ts
 // src/pages/dashboard/menu/types.ts
+export const MENU_BUCKET = "menu-images";
+
 export interface MenuItemDraft {
   name: string;
   description: string;   // '' → store as null
@@ -237,6 +213,8 @@ export interface MenuItemDraft {
 }
 export type MenuItemRow = MenuItem; // from types/models
 ```
+
+Optionally regen generated types after 007: `npx supabase gen types typescript --local > src/types/database.ts`.
 
 ---
 
@@ -268,14 +246,14 @@ const MenuManager = lazy(() => import("./pages/dashboard/menu/MenuManager"));
 
 ```
 src/pages/dashboard/menu/
-  MenuManager.tsx     orchestrator: fetch owner restaurant (incl. image_bucket) + menu_items; owns state + handlers
+  MenuManager.tsx     orchestrator: fetch owner restaurant + menu_items; owns state + handlers
   MenuManager.css
   MenuItemRow.tsx     one dish: thumbnail, name/price, veg dot, availability switch, Edit btn
   MenuItemRow.css
   MenuItemEditor.tsx  add/edit modal (mirrors DeclineModal: focus trap, ESC, backdrop, in-modal error, scroll lock)
   MenuItemEditor.css
-  ImageUploader.tsx   file input + preview + canvas compression (<115 KB) + upload to restaurant.image_bucket
-  types.ts            MenuItemDraft + helpers
+  ImageUploader.tsx   file input + preview + canvas compression (<115 KB) + upload to menu-images/{restaurant_id}/
+  types.ts            MENU_BUCKET + MenuItemDraft + helpers
   menuApi.ts          thin data layer: list / create / update / setAvailability / uploadImage / removeImage
   menuApi.test.ts     (optional) pure validation + compression-target helpers
 ```
@@ -284,12 +262,12 @@ Reuse: `humaniseSupabaseError` (`src/lib/errors.ts`), the dashboard `Toast` patt
 
 ### 5.4 Data flows
 
-**Resolve restaurant (incl. bucket) on mount** — same `.maybeSingle()` on `owner_id` as `OwnerDashboard.tsx`; null → reuse `OnboardingIncomplete`:
+**Resolve restaurant on mount** — same `.maybeSingle()` on `owner_id` as `OwnerDashboard.tsx`; null → reuse `OnboardingIncomplete`:
 
 ```ts
 const { data: restaurant } = await supabase
   .from("restaurants")
-  .select("id, name, cuisine_type, image_bucket")
+  .select("id, name, cuisine_type")
   .eq("owner_id", user.id)
   .maybeSingle();
 ```
@@ -307,7 +285,7 @@ await supabase
 **Add dish (insert row first, then optional image):**
 
 ```ts
-const { data: row, error } = await supabase
+const { data: row } = await supabase
   .from("menu_items")
   .insert({
     restaurant_id: restaurant.id,
@@ -316,7 +294,7 @@ const { data: row, error } = await supabase
   })
   .select("id, name, description, price, image_url, is_veg, is_available, updated_at")
   .single();
-// then, if a file was chosen and restaurant.image_bucket is set → uploadImage(row.id, file)
+// then, if a file was chosen → uploadImage(restaurant.id, row.id, file, row.updated_at)
 ```
 
 Insert-first avoids orphan images on a failed insert and yields a stable `{menu_item_id}` filename.
@@ -340,18 +318,20 @@ const { error } = await supabase.from("menu_items")
 if (error) { /* rollback + toast "Couldn't update. Try again." */ }
 ```
 
-**Image upload (compress → upload to the restaurant's bucket → save URL):**
+**Image upload (compress → upload to the restaurant's folder → save URL):**
 
 ```ts
-async function uploadImage(bucket: string, itemId: string, file: File, updatedAt: string) {
+import { MENU_BUCKET } from "./types";
+
+async function uploadImage(restaurantId: string, itemId: string, file: File, updatedAt: string) {
   const blob = await compressUnder(file, 115_000, 1000); // canvas downscale + quality loop
   const ext = blob.type === "image/webp" ? "webp" : "jpg";
-  const path = `${itemId}.${ext}`;                       // bucket root, named by item id
+  const path = `${restaurantId}/${itemId}.${ext}`;        // per-restaurant folder, item-id object
   const { error: upErr } = await supabase.storage
-    .from(bucket)
+    .from(MENU_BUCKET)
     .upload(path, blob, { upsert: true, contentType: blob.type });
   if (upErr) throw upErr;
-  const { data: { publicUrl } } = supabase.storage.from(bucket).getPublicUrl(path);
+  const { data: { publicUrl } } = supabase.storage.from(MENU_BUCKET).getPublicUrl(path);
   const image_url = `${publicUrl}?v=${Date.parse(updatedAt) || Date.now()}`;
   await supabase.from("menu_items").update({ image_url }).eq("id", itemId);
   return image_url;
@@ -377,13 +357,14 @@ Never render raw `error.message` — route every failure through `humaniseSupaba
 ## 6. Edge Cases & Interactions
 
 - **6.1 Disable propagation** — removes the dish from the customer menu next load (`menu_items_customer_select`) and blocks it at order time (`validate_order_item`). The trigger is the hard guarantee; no realtime needed.
-- **6.2 Price edited mid-customer-session** — `place_order` (006) recomputes the subtotal from live `menu_items.price` and raises `PRICING_MISMATCH:` on >₹0.01 disagreement; `Checkout.tsx` surfaces *"Pricing updated — please review your order."* This is correct, pre-existing behaviour — exactly the scenario that guard exists for. Document, don't fight.
+- **6.2 Price edited mid-customer-session** — `place_order` (006) recomputes the subtotal from live `menu_items.price` and raises `PRICING_MISMATCH:` on >₹0.01 disagreement; `Checkout.tsx` surfaces *"Pricing updated — please review your order."* Correct, pre-existing behaviour — exactly the scenario that guard exists for.
 - **6.3 Dish disabled while in an open cart** — `place_order` → `order_items` INSERT → `validate_order_item` raises *"Menu item is currently unavailable."* Surfaced via `humaniseSupabaseError`.
 - **6.4 Onboarding-incomplete owner** — no `restaurants` row → reuse `OnboardingIncomplete`.
-- **6.5 `image_bucket` is null** — disable image upload with the contact-admin hint (§3.2); text-only add/edit still works.
-- **6.6 Image upload fails after row insert** — row persists with `image_url = null` (customer menu renders fine without an image — `RestaurantMenu.tsx` only emits `<img>` when `image_url` is truthy). Toast + retry from the editor; no corruption.
+- **6.5 New restaurant, first dish + image** — works with **zero admin setup**: the row insert gives a `restaurant_id`/`menu_item_id`, and the first upload creates the `menu-images/{restaurant_id}/` prefix implicitly. This is the requirement that drove the shared-bucket design (§0, §3).
+- **6.6 Image upload fails after row insert** — row persists with `image_url = null` (customer menu renders fine without an image — `RestaurantMenu.tsx` only emits `<img>` when `image_url` is truthy). Toast + retry; no corruption.
 - **6.7 Two tabs / concurrent edits** — single-owner, low-frequency; last-write-wins on the row is acceptable. No order-style race guard needed.
 - **6.8 Restaurant inactive/closed** — editing works regardless; customer SELECT gates visibility, so nothing leaks.
+- **6.9 Old image (pre-consolidation)** — a dish whose `image_url` still points at an old per-restaurant bucket renders fine (those buckets stay public). Replacing it writes the new image to `menu-images/{restaurant_id}/` and rewrites `image_url` — seamless transition per dish.
 
 ---
 
@@ -414,7 +395,7 @@ Inherit all tokens from `phase2_owner_dashboard_ux_ui.md` §5 — no new colours
 
 **MenuItemEditor (modal)** — mirror `DeclineModal` interaction rules: autofocus first field, ESC + backdrop close, focus restoration, in-modal error banner, submit spinner, body scroll lock. Fields: name, description (textarea), price (₹-prefixed numeric), veg/non-veg radio, `ImageUploader`, Save / Cancel.
 
-**ImageUploader** — tap to pick → preview → **compress to < ~115 KB** (canvas) with a "Compressing…" state → upload on Save. When `image_bucket` is null, render disabled with the contact-admin hint. Show current image with Change / Remove affordances when editing.
+**ImageUploader** — tap to pick → preview → **compress to < ~115 KB** (canvas) with a "Compressing…" state → upload on Save. Show current image with Change / Remove affordances when editing.
 
 **Empty state** — *"No dishes yet. Add your first dish so customers can start ordering."* + Add Dish CTA.
 
@@ -437,33 +418,35 @@ Accessibility: availability switch is `role="switch"` + `aria-checked` (same as 
 | Layer | What to test |
 |---|---|
 | menu_items RLS (manual SQL) | Owner A cannot INSERT/UPDATE a dish for B's restaurant (403). Owner CRUDs own. UPDATE can't re-parent `restaurant_id` (WITH CHECK). Customer can't write. |
-| Storage RLS (per bucket) | Owner can upload only to *their* `image_bucket`; upload to another restaurant's bucket denied; anon can read any menu image; owner with null `image_bucket` can't upload. |
+| Storage RLS (folder) | Owner can upload only under `menu-images/{ownRestaurantId}/…`; upload to another restaurant's folder denied; anon can read; **a brand-new restaurant's owner can upload with no setup** (proves self-serve). |
 | Triggers | Disable → customer fetch omits it; order containing it → `validate_order_item` raises. Edit price → past `order_items.unit_price` unchanged; new order uses new price. |
-| Frontend (Vitest, pure) | `MenuItemDraft` validation; compression target/ext helper; cache-buster builder. (Repo scope: pure logic only, no mocked Supabase.) |
+| Frontend (Vitest, pure) | `MenuItemDraft` validation; compression target/ext helper; path builder. (Repo scope: pure logic only, no mocked Supabase.) |
 | Compression (manual) | A 4 MB phone photo compresses under 120 KB and uploads; a pathological image that can't is rejected with the friendly message. |
-| E2E (manual) | Add dish w/ image → shows on customer menu. Disable → gone for customer next reload. Edit name/price → reflected. Replace image → new image shows (cache-bust works). Null-bucket restaurant → upload disabled, text add works. Onboarding-incomplete owner → `OnboardingIncomplete`. |
+| E2E (manual) | Add dish w/ image → shows on customer menu. Disable → gone for customer next reload. Edit name/price → reflected. Replace image → new shows (cache-bust). Pre-consolidation old image still renders; replacing it moves it to the shared bucket. Onboarding-incomplete owner → `OnboardingIncomplete`. |
 
 ---
 
 ## 10. Deployment Checklist
 
-1. Apply `007_owner_menu_management.sql`: menu_items owner INSERT/UPDATE policies + `restaurants.image_bucket` column + the **per-row backfill** of the 8 existing buckets + `storage.objects` policies.
-2. **Reconcile storage policies with the Dashboard** — the buckets already exist; confirm the new `storage.objects` policies don't conflict with any policy you set earlier. Confirm each bucket's 120 KB limit + public-read are intact.
-3. Add `image_bucket` to the `Restaurant` interface in `src/types/models.ts`; optionally regen `database.ts`.
-4. Deploy frontend (avoid peak hours 12–2 PM / 7–9:30 PM per `CLAUDE.md`).
-5. **Onboarding runbook update:** when creating a new restaurant, Ankit also (a) creates its bucket, (b) sets `restaurants.image_bucket` to that bucket id. Without (b), owner image upload stays disabled.
-6. Smoke test with a real seed owner: add → edit → upload (large photo) → disable → re-enable; verify the customer side in a second browser.
-7. **Update docs on ship** (this reverses a stated v1 rule):
-   - `CLAUDE.md` — RLS summary *"Owners cannot edit menu items in v1"* → owners manage their own menu via `/dashboard/menu`; add the route to the Routes table; document the per-restaurant `menu` buckets + `restaurants.image_bucket` in the Hosting/env section.
+1. **Create the shared `menu-images` bucket once** (public, MIME allowlist, 120 KB limit) — Dashboard or in a setup step. This is the only storage provisioning, ever; new restaurants need nothing.
+2. Apply `007_owner_menu_management.sql`: `menu_items` owner INSERT/UPDATE policies + `storage.objects` folder-scoped policies. Verify they don't conflict with policies already set on the old buckets in the Dashboard.
+3. Deploy frontend (avoid peak hours 12–2 PM / 7–9:30 PM per `CLAUDE.md`).
+4. Smoke test with a real seed owner: add → edit → upload (large photo, confirm <120 KB) → disable → re-enable; verify the customer side in a second browser. Also test a restaurant that has **no** prior images (proves the self-serve first-upload path).
+5. **(Optional, later)** Run the migration script to move the existing 8 restaurants' images into `menu-images/{restaurant_id}/` and retire the old per-restaurant buckets (§3.4). Not required for launch.
+6. **Update docs on ship** (this reverses a stated v1 rule):
+   - `CLAUDE.md` — RLS summary *"Owners cannot edit menu items in v1"* → owners manage their own menu via `/dashboard/menu`; add the route to the Routes table; document the shared `menu-images` bucket + `menu-images/{restaurant_id}/{menu_item_id}` convention in the Hosting/env section.
    - `GEMINI.md` — mirror.
-   - `redlotusfoods_documentation.md` §4.8 — owner `menu_items` write policies + `image_bucket`.
+   - `redlotusfoods_documentation.md` §4.8 — owner `menu_items` write policies + storage model.
 
 ---
 
-## 11. Open Decisions (need your call)
+## 11. Decisions
 
-1. **Placement:** dedicated `/dashboard/menu` route (recommended) vs. a collapsible section on `/dashboard`.
-2. **Delete:** ship disable-only (recommended) vs. hard-delete with the `23503` guard vs. soft-delete `is_archived` column.
-3. **Image required or optional:** recommend **optional** (schema allows null; customer menu renders fine without one) so owners aren't blocked on photography.
-4. **Storage model long-term:** keep one-bucket-per-restaurant (current; this plan) vs. v2 consolidation to a single shared bucket with per-restaurant *folders* (simpler RLS via `(storage.foldername(name))[1] = restaurant_id`, no per-restaurant bucket sprawl, but requires migrating the existing 8). Out of scope now — flag for v2 if bucket count or onboarding friction grows.
-5. **Compression target format:** WebP primary with JPEG fallback (recommended) vs. JPEG-only (simpler, slightly larger files under the 120 KB cap).
+| # | Decision | Status |
+|---|---|---|
+| 1 | **New-restaurant storage provisioning** | **Resolved: single shared `menu-images` bucket + per-restaurant folders.** Folders are implicit (created on first upload), so a new restaurant is fully self-serve — no admin, no `service_role`, no per-restaurant bucket/column. This was chosen specifically to answer "does a new owner need admin to set up storage?" → **no.** |
+| 2 | **Existing 8 buckets** | Hybrid: leave as-is (old image_urls still render); new uploads go to the shared bucket. Optional one-off migration later (§3.4). |
+| 3 | **Placement** | Recommended: dedicated `/dashboard/menu` route (vs. a section on `/dashboard`). Confirm. |
+| 4 | **Delete** | Recommended: disable-only (FK RESTRICT). Hard-delete or soft-delete deferred (§2.2). Confirm. |
+| 5 | **Image required?** | Recommended: optional (schema allows null; customer menu renders fine without one). Confirm. |
+| 6 | **Compression format** | Recommended: WebP primary, JPEG fallback. Confirm. |
