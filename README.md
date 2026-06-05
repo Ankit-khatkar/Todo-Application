@@ -180,8 +180,8 @@ CREATE POLICY "menu_images_owner_delete" ON storage.objects    -- remove image
 
 `menu_items.image_url` stores **full URLs**, and the old per-restaurant buckets remain public — so existing images keep rendering with no change. We do **not** have to migrate before shipping.
 
-- **Default (hybrid):** Leave the 8 old buckets in place. All **new** owner uploads/replaces go to `menu-images/{restaurant_id}/…`; the row's `image_url` is rewritten to the new URL. Old images naturally age out as owners re-upload.
-- **Optional cleanup (later):** A one-off script (Node + `service_role`) copies each old object into `menu-images/{restaurant_id}/{menu_item_id}.{ext}`, rewrites `image_url`, then deletes the old buckets. Pure SQL can't move objects across buckets — it needs the Storage API. Not required for launch; do it when convenient to retire the old buckets.
+- **Default (hybrid):** Leave the 8 old buckets in place. All **new** owner uploads/replaces go to `menu-images/{restaurant_id}/…`; the row's `image_url` is rewritten to the new URL. When an owner **replaces** a pre-consolidation image, the new image lands in the shared bucket and `image_url` is repointed — but the old object stays as an **orphan** in the per-restaurant bucket. Owners **cannot delete it themselves** (the §3.3 delete policy only covers `menu-images`; they have no delete grant on the old buckets), so these orphans are harmless storage that only the cleanup script (below) can remove. *Don't describe this as auto-deletion — it isn't.*
+- **Optional cleanup (later):** A one-off **idempotent** script (Node + `service_role`) walks `menu_items`, and **for rows whose `image_url` does NOT already point at `menu-images`**, copies the old object into `menu-images/{restaurant_id}/{menu_item_id}.{ext}`, rewrites `image_url`, then deletes the old buckets. Skipping already-migrated rows is what makes it safe to re-run and safe to run after owners have already replaced some images themselves. Pure SQL can't move objects across buckets — it needs the Storage API. Not required for launch.
 
 ### 3.5 Compression (mandatory — 120 KB) & replace/remove
 
@@ -191,8 +191,9 @@ CREATE POLICY "menu_images_owner_delete" ON storage.objects    -- remove image
 2. Re-encode to **WebP** (best ratio; JPEG fallback on old Safari) via `<canvas>`.
 3. **Iterate quality down** until the blob is **< ~115 KB** (headroom under 120 KB). If it can't get under even at minimum quality, reject: *"Couldn't compress this image under 120 KB — try a simpler or smaller photo."*
 
-- **Replace:** `upload(path, blob, { upsert: true })` overwrites `{menu_item_id}.{ext}`; cache-bust `image_url` with `?v=${Date.parse(updated_at)}` so customers refetch.
-- **Remove (keep dish):** `image_url = null` + best-effort `remove([path])` (orphans are harmless if delete fails).
+- **Replace (same shared-bucket key):** `upload(path, blob, { upsert: true })` overwrites `{menu_item_id}.{ext}`. **Cache-bust with a *fresh* `?v=${Date.now()}`** — *not* the row's existing `updated_at`. The base public URL is unchanged on a same-key overwrite, so reusing a stale timestamp yields an identical `image_url` and the CDN keeps serving the old image. A fresh value forces the refetch.
+- **Replace (ext changed, e.g. jpg→webp) or first move off an old bucket:** the new key differs from the old, so after a successful upload, **best-effort delete the previous object only if it lived in the shared bucket** (`menu-images`). Old per-restaurant-bucket objects are left for the cleanup script (§3.4) — the owner has no delete rights there. See the helper in §5.4.
+- **Remove (keep dish):** `image_url = null` + best-effort `remove([sharedKey])` if the current image is in `menu-images` (orphans are harmless if delete fails).
 
 ---
 
@@ -294,7 +295,7 @@ const { data: row } = await supabase
   })
   .select("id, name, description, price, image_url, is_veg, is_available, updated_at")
   .single();
-// then, if a file was chosen → uploadImage(restaurant.id, row.id, file, row.updated_at)
+// then, if a file was chosen → uploadImage(restaurant.id, row.id, file, null)  // new dish: no prior image
 ```
 
 Insert-first avoids orphan images on a failed insert and yields a stable `{menu_item_id}` filename.
@@ -323,16 +324,40 @@ if (error) { /* rollback + toast "Couldn't update. Try again." */ }
 ```ts
 import { MENU_BUCKET } from "./types";
 
-async function uploadImage(restaurantId: string, itemId: string, file: File, updatedAt: string) {
+const SHARED_PREFIX = "/storage/v1/object/public/menu-images/";
+
+// In-bucket key (e.g. "{rid}/{iid}.jpg") IF the URL points at the shared
+// bucket; null for an old per-restaurant-bucket URL (owner can't delete there).
+function sharedKeyFromUrl(url: string | null): string | null {
+  if (!url) return null;
+  const i = url.indexOf(SHARED_PREFIX);
+  if (i === -1) return null;
+  return decodeURIComponent(url.slice(i + SHARED_PREFIX.length).split("?")[0]);
+}
+
+// prevImageUrl = the dish's current image_url (null for a new dish).
+async function uploadImage(
+  restaurantId: string, itemId: string, file: File, prevImageUrl: string | null,
+) {
   const blob = await compressUnder(file, 115_000, 1000); // canvas downscale + quality loop
   const ext = blob.type === "image/webp" ? "webp" : "jpg";
   const path = `${restaurantId}/${itemId}.${ext}`;        // per-restaurant folder, item-id object
+
   const { error: upErr } = await supabase.storage
     .from(MENU_BUCKET)
     .upload(path, blob, { upsert: true, contentType: blob.type });
   if (upErr) throw upErr;
+
+  // Best-effort delete the PREVIOUS object only if it was in the shared bucket
+  // under a different key (ext change). Old per-restaurant-bucket images can't
+  // be deleted here (no RLS grant) — the §3.4 cleanup script retires those.
+  const prevKey = sharedKeyFromUrl(prevImageUrl);
+  if (prevKey && prevKey !== path) {
+    await supabase.storage.from(MENU_BUCKET).remove([prevKey]).catch(() => {});
+  }
+
   const { data: { publicUrl } } = supabase.storage.from(MENU_BUCKET).getPublicUrl(path);
-  const image_url = `${publicUrl}?v=${Date.parse(updatedAt) || Date.now()}`;
+  const image_url = `${publicUrl}?v=${Date.now()}`;       // FRESH — busts CDN on same-key replace
   await supabase.from("menu_items").update({ image_url }).eq("id", itemId);
   return image_url;
 }
@@ -364,7 +389,7 @@ Never render raw `error.message` — route every failure through `humaniseSupaba
 - **6.6 Image upload fails after row insert** — row persists with `image_url = null` (customer menu renders fine without an image — `RestaurantMenu.tsx` only emits `<img>` when `image_url` is truthy). Toast + retry; no corruption.
 - **6.7 Two tabs / concurrent edits** — single-owner, low-frequency; last-write-wins on the row is acceptable. No order-style race guard needed.
 - **6.8 Restaurant inactive/closed** — editing works regardless; customer SELECT gates visibility, so nothing leaks.
-- **6.9 Old image (pre-consolidation)** — a dish whose `image_url` still points at an old per-restaurant bucket renders fine (those buckets stay public). Replacing it writes the new image to `menu-images/{restaurant_id}/` and rewrites `image_url` — seamless transition per dish.
+- **6.9 Replacing a pre-consolidation image** — a dish whose `image_url` still points at an old per-restaurant bucket renders fine (those buckets stay public). Replacing it writes the new image to `menu-images/{restaurant_id}/`, rewrites `image_url`, and busts the cache with `?v=Date.now()` — seamless for the customer. The old object is **orphaned** in the per-restaurant bucket (owner has no delete grant there); the §3.4 cleanup script removes it later. This is expected, not a leak to fix per-replace.
 
 ---
 
