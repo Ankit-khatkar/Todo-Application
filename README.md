@@ -187,9 +187,12 @@ CREATE POLICY "menu_images_owner_delete" ON storage.objects    -- remove image
 
 120 KB is small; a raw phone photo (2–5 MB) is rejected by the bucket limit. `ImageUploader` **must** compress before upload:
 
-1. Downscale to a max longest edge (~800–1000 px is plenty for a menu thumbnail).
-2. Re-encode to **WebP** (best ratio; JPEG fallback on old Safari) via `<canvas>`.
-3. **Iterate quality down** until the blob is **< ~115 KB** (headroom under 120 KB). If it can't get under even at minimum quality, reject: *"Couldn't compress this image under 120 KB — try a simpler or smaller photo."*
+1. Decode with `createImageBitmap(file, { imageOrientation: "from-image" })` — **honour EXIF orientation**, or phone photos upload sideways. (Fall back to an `<img>`+`URL.createObjectURL` decode if `createImageBitmap` is unavailable.)
+2. Downscale to a max longest edge (~800–1000 px is plenty for a menu thumbnail).
+3. Re-encode to **WebP** via `<canvas>.toBlob('image/webp', q)`. **`toBlob` can return `null` or ignore WebP on old Safari** — null-check and **fall back to `image/jpeg`**.
+4. **Iterate quality down** until the blob is **< ~115 KB** (headroom under the 120 KB bucket cap — note "120 KB" is ambiguous KB vs KiB, so leave margin). If it can't get under even at minimum quality, reject: *"Couldn't compress this image under 120 KB — try a simpler or smaller photo."*
+
+> **iOS HEIC caveat (mobile owners are the primary device).** iPhone photos are frequently **HEIC**, which most browsers' `<canvas>`/`createImageBitmap` **cannot decode** — `compressUnder` will throw. Set `<input accept="image/jpeg,image/png,image/webp">` (which nudges iOS to hand back a JPEG conversion in many flows), **validate `file.type`**, and wrap the decode in try/catch with a friendly message: *"This photo format isn't supported. Try a JPEG or PNG."* Don't let a HEIC file surface a raw decode exception.
 
 - **Replace (same shared-bucket key):** `upload(path, blob, { upsert: true })` overwrites `{menu_item_id}.{ext}`. **Cache-bust with a *fresh* `?v=${Date.now()}`** — *not* the row's existing `updated_at`. The base public URL is unchanged on a same-key overwrite, so reusing a stale timestamp yields an identical `image_url` and the CDN keeps serving the old image. A fresh value forces the refetch.
 - **Replace (ext changed, e.g. jpg→webp) or first move off an old bucket:** the new key differs from the old, so after a successful upload, **best-effort delete the previous object only if it lived in the shared bucket** (`menu-images`). Old per-restaurant-bucket objects are left for the cleanup script (§3.4) — the owner has no delete rights there. See the helper in §5.4.
@@ -215,7 +218,9 @@ export interface MenuItemDraft {
 export type MenuItemRow = MenuItem; // from types/models
 ```
 
-Optionally regen generated types after 007: `npx supabase gen types typescript --local > src/types/database.ts`.
+> **The Supabase client is untyped.** `src/lib/supabaseClient.ts` calls `createClient(url, key)` with **no `<Database>` generic**, so `supabase.from("menu_items").insert/update()` is loosely typed — it won't validate columns and returns `any`-ish data. **Follow the existing dashboard convention: cast results** (`(data as unknown) as MenuItemRow`), exactly as `OwnerDashboard.tsx` does. Don't assume column-level type safety.
+>
+> **`database.ts` is generated but stale** — it predates migration 006 (no `discount_amount`/`delivery_fee` on `orders`, and a 4-arg `place_order`). The `menu_items` block in it is correct and complete. The comment in `models.ts` calling `database.ts` "enums-only" is outdated. Regenerating after 007 is optional and harmless (the client is untyped), but note it will also pull in unrelated 006 drift — review that diff before committing it.
 
 ---
 
@@ -225,16 +230,20 @@ Optionally regen generated types after 007: `npx supabase gen types typescript -
 
 The Owner Dashboard (`/dashboard`) is an **operational cockpit** (`phase2_owner_dashboard_ux_ui.md` §0: glanceable, real-time, one action per card, refresh-is-a-bug). Menu management is the opposite — occasional, form-heavy config. Bolting a CRUD editor onto the orders page violates "Pending must be visible without switching views."
 
-**Recommendation:** a dedicated owner-only route **`/dashboard/menu`**, lazy-loaded (consistent with the code-split routes in `App.tsx`), reachable via a **"Manage Menu"** link in `RestaurantHeader` (and/or the owner Navbar state). Orders cockpit stays untouched. (Open decision — §11.)
+**Recommendation:** a dedicated owner-only route **`/dashboard/menu`**, lazy-loaded (consistent with the code-split routes in `App.tsx`). Orders cockpit stays untouched. (Open decision — §11.)
+
+**Required entry-point wiring (don't skip — the route is otherwise unreachable):** the owner Navbar (`Navbar.tsx`) currently renders only `{ to: "/dashboard", label: "Dashboard" }` for `role === "owner"`. Add `{ to: "/dashboard/menu", label: "Menu" }` to that owner `leftLinks` array (it auto-propagates to the mobile menu too). Optionally also add a "Manage Menu" button in `RestaurantHeader`/`OwnerDashboard` for discoverability.
 
 ### 5.2 Routing & guard
 
 ```tsx
-// src/App.tsx — inside the existing <Suspense>
+// src/App.tsx — inside the existing <Suspense>, alongside the other lazy imports
 const MenuManager = lazy(() => import("./pages/dashboard/menu/MenuManager"));
 // ...
+// NOTE: App.tsx uses RELATIVE route paths (path="dashboard", not "/dashboard").
+// Match that convention — use "dashboard/menu", not "/dashboard/menu".
 <Route
-  path="/dashboard/menu"
+  path="dashboard/menu"
   element={
     <ProtectedRoute role="owner">
       <MenuManager />
@@ -375,7 +384,7 @@ async function uploadImage(
 | is_veg | required radio (veg / non-veg), no default | `NOT NULL` (insert fails if omitted) |
 | image | optional; jpeg/png/webp in, compressed to < ~115 KB out | 120 KB bucket limit |
 
-Never render raw `error.message` — route every failure through `humaniseSupabaseError`.
+Never render raw `error.message`. Route **`menu_items` table-write** failures through `humaniseSupabaseError` (its Postgres-code mapping applies). Handle **Storage** upload/remove failures with tailored copy instead — see §6.10.
 
 ---
 
@@ -390,6 +399,7 @@ Never render raw `error.message` — route every failure through `humaniseSupaba
 - **6.7 Two tabs / concurrent edits** — single-owner, low-frequency; last-write-wins on the row is acceptable. No order-style race guard needed.
 - **6.8 Restaurant inactive/closed** — editing works regardless; customer SELECT gates visibility, so nothing leaks.
 - **6.9 Replacing a pre-consolidation image** — a dish whose `image_url` still points at an old per-restaurant bucket renders fine (those buckets stay public). Replacing it writes the new image to `menu-images/{restaurant_id}/`, rewrites `image_url`, and busts the cache with `?v=Date.now()` — seamless for the customer. The old object is **orphaned** in the per-restaurant bucket (owner has no delete grant there); the §3.4 cleanup script removes it later. This is expected, not a leak to fix per-replace.
+- **6.10 Storage errors don't map cleanly via `humaniseSupabaseError`** — a `StorageError` has **no `.code`**, and an RLS denial ("new row violates row-level security policy") is lowercase, so it fails the mapper's `/^[A-Z]/` verbatim gate and collapses to the generic message. **Handle storage upload/remove failures explicitly** with tailored copy (*"Couldn't upload the image. Try again."*) rather than routing them through `humaniseSupabaseError`. Reserve `humaniseSupabaseError` for the `menu_items` table writes (§5.5), where the Postgres codes (`42501`, `23514`, `23503`) map correctly.
 
 ---
 
@@ -447,6 +457,7 @@ Accessibility: availability switch is `role="switch"` + `aria-checked` (same as 
 | Triggers | Disable → customer fetch omits it; order containing it → `validate_order_item` raises. Edit price → past `order_items.unit_price` unchanged; new order uses new price. |
 | Frontend (Vitest, pure) | `MenuItemDraft` validation; compression target/ext helper; path builder. (Repo scope: pure logic only, no mocked Supabase.) |
 | Compression (manual) | A 4 MB phone photo compresses under 120 KB and uploads; a pathological image that can't is rejected with the friendly message. |
+| Image formats (manual, real iPhone) | A HEIC photo from an iPhone is either converted by iOS to JPEG (works) or rejected with the friendly format message — never an unhandled decode crash. A portrait photo uploads upright (EXIF honoured). |
 | E2E (manual) | Add dish w/ image → shows on customer menu. Disable → gone for customer next reload. Edit name/price → reflected. Replace image → new shows (cache-bust). Pre-consolidation old image still renders; replacing it moves it to the shared bucket. Onboarding-incomplete owner → `OnboardingIncomplete`. |
 
 ---
