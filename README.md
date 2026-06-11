@@ -1,664 +1,219 @@
-# Order Alert SMS (owner escalation via MSG91) — Build Plan
+# Restaurant Card Image Slideshow — Build Plan
 
-> **Status:** Planning
-> **Duration:** ~1 day
-> **Goal:** When a customer places an order and the restaurant does **not** accept or decline it within ~1 minute, RedLotus automatically sends **one** SMS to the restaurant's phone (`restaurants.phone`) prompting the owner to open the dashboard and confirm the order. This is a *backstop* for the in-dashboard audio alert (`useNewOrderAlert`), which only fires when the owner has the dashboard open in a browser tab with sound unlocked.
+> **Status:** Planned — nothing implemented yet. This document is the agreed design.
+> **Duration:** ~1 day (migration + frontend) + ongoing admin time to photograph/upload images per restaurant.
+> **Goal:** Each restaurant card on `/restaurants` shows up to **5 images** that auto-advance as a slideshow, instead of today's single static `image_url`. Tapping the card keeps navigating to the menu, exactly as it does now.
 > **Prerequisites:**
-> - Phases 0–4 complete and merged. Ordering, the owner dashboard, and the `expire-orders` cron all work in production.
-> - **DLT registration with Airtel complete** for the order-alert content template (details in §3). This is non-negotiable in India — TRAI drops any transactional SMS sent without a DLT-approved template/header pairing.
-> - **MSG91 account active** with the Airtel DLT mapping linked (PE ID, Header `RDLOTS`, the order-alert content template), and a **Flow created in MSG91** for that template (§3.2) — the Flow yields MSG91's internal template ID, which is what the API needs.
-> - Supabase Edge Functions + `pg_cron`/`pg_net` already proven by the live `expire-orders` deployment. This feature reuses that exact plumbing.
+> - None technical — this is a self-contained schema tweak + frontend feature on the existing `restaurants` table and `RestaurantList.tsx`.
+> - Operationally: real photos per restaurant (interior, signature dishes, storefront). The feature degrades gracefully without them (§2.4), so it can ship before all photos exist.
 
 ---
 
 ## 1. Why This Feature Exists
 
-The owner dashboard already plays a chime when a new order arrives (`src/pages/dashboard/useNewOrderAlert.ts` → `OwnerDashboard.tsx`). But that alert has a hard precondition: **the dashboard must be open in a live browser tab, and the browser's autoplay gesture must have been unlocked.** In practice, the owner is frequently *not* looking at the dashboard:
+The restaurant card is the customer's first impression of a restaurant — and right now it carries exactly one image (or a flat gradient placeholder). One photo can't show a storefront *and* the food *and* the seating. Five rotating photos let each restaurant present a richer storefront on the list page, which is where the order funnel starts.
 
-- The phone is in their pocket / the tab is backgrounded or closed.
-- The laptop is asleep, or they're serving customers in the shop.
-- Browser autoplay reset the audio unlock on the last page reload and nobody re-armed it.
-
-When that happens, a new order sits in `pending` and silently rides the **15-minute auto-expiry** clock (`expire-orders`). The customer waits, the order expires, and a sale is lost — the single worst outcome in the funnel, because the customer was ready to pay (COD) and we simply failed to reach the restaurant.
-
-SMS solves the one thing the in-app chime cannot: it reaches the restaurant **at the device level, without the dashboard being open**. The escalation ladder becomes:
-
-| Time after order | Channel | Requires dashboard open? |
-|---|---|---|
-| 0 s | In-app chime + title-bar flash (`useNewOrderAlert`) | Yes |
-| ~1–2 min, still `pending` | **SMS to `restaurants.phone`** (this feature) | **No** |
-| 15 min, still `pending` | Auto-expire (`expire-orders`) | No |
-
-This feature fills the middle rung.
+This is a conversion play on the highest-traffic authenticated page in the app, at near-zero ongoing cost (no new services, no Edge Functions, no cron).
 
 ---
 
 ## 2. Decisions & Constraints
 
-These are settled. Each is load-bearing on the implementation below.
+These are settled (discussed and confirmed 2026-06-11). Each is load-bearing on the implementation below.
 
-### 2.1 Recipient — the restaurant line (`restaurants.phone`)
+### 2.1 Interaction — auto-play; tap keeps navigating to the menu
 
-The SMS goes to **`restaurants.phone`**, not the owner's personal `users.phone`. Rationale: the restaurant line is the operational number the founder records for each restaurant at onboarding, and it's the number a restaurant expects order traffic on.
+The whole card is currently a single `<Link to={"/restaurants/" + id}>` (`RestaurantList.tsx`). The original idea — *"tap on the slide to start the slide"* — conflicts with that: a tap that starts the slideshow can't also open the menu, and splitting the tap target (image vs. card body) or requiring two taps both add friction right where customers decide to order.
 
-> **Data-quality requirement (new, important):** `restaurants.phone` is **nullable** today (`001_schema.sql`) and is documented as *"internal/admin only."* For this feature to work, **every active restaurant must carry a valid 10-digit Indian mobile in `restaurants.phone`.** This becomes an onboarding checklist item. An order whose restaurant has a null/invalid phone is **permanently skipped** by the function (logged once, never alerted) — see §6.3. Audit existing rows before launch:
-> ```sql
-> SELECT id, name, phone FROM public.restaurants
-> WHERE is_active = true
->   AND (phone IS NULL OR phone !~ '^[6-9][0-9]{9}$');
-> -- Every row returned is a restaurant that will NOT receive order alerts.
-> ```
+**Decision:** the slideshow **auto-plays** (no tap needed), and **tapping anywhere on the card navigates to the menu, unchanged.** No dead taps, no behaviour change to the funnel, no new tap targets inside a `<Link>`.
 
-> **Deferred (v2):** alerting the owner's personal `users.phone` as well, or instead, or letting a restaurant register multiple alert numbers (owner + manager). Logged in §10.
+- Advance interval: **3.5 s** per slide (single constant, e.g. `SLIDE_INTERVAL_MS = 3500`).
+- Loops forever (`(i + 1) % images.length`).
+- Desktop hover **pauses** the slideshow (the card already has a hover scale effect; pausing while the user is inspecting the image is the expected behaviour).
+- Auto-play runs **only while the card is on-screen and the tab is visible** — see §6.2.
 
-### 2.2 Cadence — one SMS per order, ever
+### 2.2 Image management — admin only (Supabase Dashboard), no owner UI
 
-A single SMS is sent per order, once, ~1 minute after placement if the order is still `pending`. **No repeat reminders.** This keeps the design to a single idempotency marker (`orders.owner_notified_at`), keeps cost trivial, and avoids hammering a restaurant that is mid-rush with the same generic buzz. Repeating reminders / escalation cadence is a v2 item (§10).
+You (Ankit) upload images to Storage and write the URLs into the new column from the Supabase Dashboard — the same way restaurants are onboarded today. **No owner-facing upload UI in this version.** This keeps the scope to one migration + one component; the owner self-service version (reusing the menu-image upload/compression/RLS pattern from `/dashboard/menu`) is logged as a v2 item (§10).
 
-### 2.3 Provider — MSG91 **Flow API** (transactional SMS), *not* the OTP API
+### 2.3 Data model — `restaurants.image_urls text[]`, ordered, max 5
 
-The OTP flow (`send-otp`/`verify-otp`) uses MSG91's **OTP API** (`/api/v5/otp`). This is a different product. A plain DLT-templated transactional SMS goes through the **Flow API**:
+A new column on `restaurants`, not a separate table:
 
-```
-POST https://control.msg91.com/api/v5/flow/
-```
+- `image_urls text[] NOT NULL DEFAULT '{}'` — array position **is** the display order; first element is the lead image.
+- `CHECK (cardinality(image_urls) <= 5)` — the 5-image cap lives in the DB, not just in UI convention.
+- **`image_url` (singular) stays untouched.** `RestaurantMenu.tsx` still reads it for the menu-page header, and it remains the fallback for cards whose `image_urls` is empty (§2.4). No drop, no rename, no backfill required — though backfilling `image_urls = ARRAY[image_url]` for rows that have one is a harmless optional step (§3).
 
-> **Why this matters:** the OTP API generates and stores a code; we don't want a code, we want to deliver fixed approved copy. The Flow API takes a `template_id` (MSG91's internal ID for a *Flow* you create around the DLT template) plus a `recipients[]` list. Because our approved template has **no variables**, the recipient object only carries `mobiles`.
+Why not a `restaurant_images` table: per-image metadata (captions, per-image RLS, owner uploads) is exactly the v2 feature set we deferred. For "an ordered list of up to 5 public URLs managed by one admin," an array column is one migration, zero new RLS policies, and one fewer join on the hottest customer query.
 
-### 2.4 The `template_id` gotcha (same trap as the OTP template)
+### 2.4 Count — *up to* 5; graceful degradation below that
 
-> **`MSG91_ORDER_ALERT_TEMPLATE_ID` must be MSG91's internal Flow/template ID — NOT the Airtel DLT registry number `1007344532626504981`.**
+5 is a **cap, not a requirement**. The card derives its image list and picks a rendering mode:
 
-This is the exact gotcha already burned into `CLAUDE.md` for the OTP template ("must be MSG91's internal 24-char ObjectId … NOT the long-numeric DLT registry ID"). Passing the DLT number `1007344532626504981` to the Flow API returns a template-invalid error surfaced as a provider failure and **no SMS is delivered**, even though the call may look like it succeeded. You get the internal ID only by **creating a Flow in MSG91** around the approved template (§3.2).
-
-### 2.5 A separate Edge Function on its own cron (not folded into `expire-orders`)
-
-We add a new function `notify-pending-orders` with its **own** `pg_cron` schedule, rather than extending `expire-orders`. Rationale — same blast-radius logic the phone plan used to keep `send-otp`/`verify-otp` split:
-
-- `expire-orders` does a free, idempotent, single-statement state change. `notify-pending-orders` **spends money** (paid SMS) and calls a flaky third party. Different failure modes, different things to monitor, different deploy cadence — keep the audit boundary clean.
-- A bug in the SMS loop must never be able to break order expiry, and vice-versa.
-
-Both run every minute; running two per-minute cron jobs is fine at this scale.
-
-### 2.6 Timing — threshold is 1 minute, effective delay is ~1–2 minutes
-
-The function selects orders whose `created_at` is **≥ 1 minute** in the past and that are still `pending`. Because the cron fires once per minute, the *actual* delay a given order experiences is between **1 and 2 minutes** (an order placed at 12:00:30 is too young at the 12:01:00 run and is first picked up at 12:02:00). This is acceptable and is documented behaviour, not a bug. The threshold is a single constant (`ALERT_AFTER_MINUTES = 1`) — trivially tunable later.
-
-### 2.7 Idempotency — "claim-then-send" via `orders.owner_notified_at`
-
-A new nullable column `orders.owner_notified_at timestamptz` marks an order as *handled by the alert pipeline*. The function **claims** an order with a conditional `UPDATE … WHERE status='pending' AND owner_notified_at IS NULL` **before** sending the SMS. Two guarantees fall out:
-
-1. **No double-send.** If two cron invocations overlap (a slow run + the next tick), only one wins the conditional UPDATE; the other sees 0 rows and skips.
-2. **No spurious send after the owner acts.** The claim filters `status='pending'`, so if the owner accepted/declined in the meantime, the claim returns 0 rows and we never send.
-
-> **Documented trade-off:** claim-*before*-send means a transient MSG91 outage at the moment of sending **skips that order's alert** (the row is already claimed, so the next run won't retry). This is deliberate: for a money-spending backstop, *not double-charging / not double-buzzing* matters more than guaranteeing every single alert, and the in-app chime + 15-min expiry still apply. A retry-on-failure upgrade (reset `owner_notified_at` to NULL in the failure branch) is a one-line change documented in §6.4 and listed in §10.
-
-`owner_notified_at` semantics: **set when the SMS is sent OR when the order is permanently skipped (no valid restaurant phone). `NULL` = not yet handled.**
-
-### 2.8 SMS wording — DLT-approved text ships as-is (accepted exception to "no app" rule)
-
-The approved content is, verbatim:
-
-```
-Order Alert! You have a new order on RedLotus! Open the Restaurant Partner app to view & confirm the order. - Team RedLotus
-```
-
-> **Known exception:** RedLotus's product rule is *website-only — never reference "app"/"download"/"install" in UI* (`CLAUDE.md` → Product constraints). This SMS says *"Restaurant Partner app."* We ship it anyway, because **DLT-approved template text cannot be edited without a fresh Airtel approval cycle**, and re-approval is not worth blocking this feature on. This is a conscious, documented exception confined to the SMS channel.
->
-> **v2 option (logged in §10):** submit a website-friendly variant (e.g. *"Open your RedLotus dashboard to confirm the order"*) for DLT re-approval, then swap the Flow's template.
-
-### 2.9 Cost
-
-- MSG91 transactional SMS: ~₹0.20–0.25 per message (confirm the live rate in **MSG91 Dashboard → Wallet → Pricing**).
-- This SMS only fires when an order is *ignored* for a minute. Early on (owners not yet habituated to the dashboard) it may fire often; as owners learn to keep the dashboard open it should taper. Even a pessimistic 20 alerts/day ≈ **₹4/day ≈ ₹120/month** worst case; realistically a fraction of that. Negligible for v1; glance at the MSG91 wallet weekly (§9).
-
----
-
-## 3. Provider Setup (MSG91 Dashboard — manual, one-time)
-
-These steps happen in the MSG91 web UI, not in code. Do them once before Step 1 of the build sequence.
-
-### 3.1 Confirm the Airtel DLT mapping is loaded in MSG91
-
-1. **MSG91 → Inbound → DLT → Connect DLT.** The Airtel PE shows `Verified`.
-2. **MSG91 → Inbound → DLT → Headers.** Header **`RDLOTS`** is `Approved`. (Its DLT Header ID is `1005132367990441245` — the same header already used by the OTP flow; see `phone_verification_plan.md` §3.1.)
-3. **MSG91 → Inbound → DLT → Templates.** The order-alert **content** template is present and `Approved`, mapped to DLT content template ID **`1007344532626504981`**, with body exactly:
-   ```
-   Order Alert! You have a new order on RedLotus! Open the Restaurant Partner app to view & confirm the order. - Team RedLotus
-   ```
-
-### 3.2 Create the Flow → get MSG91's internal template ID
-
-The Flow API needs MSG91's **internal** template ID, not the DLT registry number (§2.4).
-
-1. **MSG91 → Campaigns / Flows → Create Flow** (UI labels shift over MSG91 versions; it may sit under **Send → Flow** or **SMS → Templates**).
-2. Bind it to the **`RDLOTS`** sender and the **approved order-alert content template** from §3.1.
-3. Because the content has **no `{#var#}` placeholders**, the Flow has **no variables**.
-4. Save. MSG91 issues an **internal template/Flow ID** (a 24-char hex/ObjectId, e.g. `6a1b…`). **This is `MSG91_ORDER_ALERT_TEMPLATE_ID`.**
-
-### 3.3 Recorded values for RedLotus Foods
-
-| Field | Value |
+| Images available | Card renders |
 |---|---|
-| Header (Sender ID) | `RDLOTS` |
-| Header DLT ID | `1005132367990441245` |
-| DLT **content** template ID (Airtel registry) | `1007344532626504981` |
-| **MSG91 internal Flow/template ID** | `<fill in after §3.2 — this is the env var value>` |
-| Approved content | `Order Alert! You have a new order on RedLotus! Open the Restaurant Partner app to view & confirm the order. - Team RedLotus` |
+| 0 (and no legacy `image_url`) | Gradient placeholder, as today |
+| 1 | Static image, as today — **no slideshow chrome, no timer, no dots** |
+| 2–5 | Auto-playing slideshow + dot indicators |
 
-> These IDs are **not secrets** (registry/flow identifiers are useless without the MSG91 Auth Key, which *is* secret and never committed). Safe to keep in this doc and reference from config.
+Derivation rule (single helper, see §5.1): `image_urls` when non-empty, else `[image_url]` when set, else `[]`. This means the feature ships safely with **zero data work** — every existing restaurant just keeps its current single image until you upload more.
 
----
+### 2.5 No RLS or security changes
 
-## 4. Architecture
+`image_urls` is just another column on `restaurants`; the existing customer SELECT policy (`is_active AND is_open`) already covers it. Writes happen via the Supabase Dashboard (service role / admin), so no new write policy is needed. The storage bucket is public-read like the existing image buckets (§4).
 
-```
-        ┌──────────────────────────────────────────────────────────┐
-        │  Postgres: pg_cron  '* * * * *'  (every minute)            │
-        │     └─ pg_net.http_post → Edge Function                    │
-        │            with header  X-Cron-Secret: <CRON_SECRET>       │
-        └───────────────────────────┬──────────────────────────────┘
-                                     ▼
-        ┌──────────────────────────────────────────────────────────┐
-        │   Edge Function: notify-pending-orders (service role)      │
-        │  ┌────────────────────────────────────────────────────┐   │
-        │  │ 1. Auth: X-Cron-Secret == CRON_SECRET              │   │
-        │  │ 2. SELECT orders WHERE status='pending'            │   │
-        │  │      AND owner_notified_at IS NULL                 │   │      MSG91 Flow API
-        │  │      AND created_at <= now() - 1 min               │   │   ┌──────────────────┐
-        │  │      JOIN restaurants (id, name, phone)            │   │   │ POST /api/v5/    │
-        │  │ 3. for each candidate:                             │   │   │      flow/       │
-        │  │    a. CLAIM: UPDATE owner_notified_at=now()        │───┼──▶│  template_id     │
-        │  │       WHERE id=? AND status='pending'              │   │   │  recipients[]    │
-        │  │       AND owner_notified_at IS NULL  (0 rows→skip) │   │   │   mobiles=91XXXX │
-        │  │    b. validate restaurant phone (^[6-9]\d{9}$)     │   │   └──────────────────┘
-        │  │    c. send SMS via MSG91 Flow                      │   │            │
-        │  │ 4. return { sent, skippedNoPhone, … }              │   │            ▼
-        │  └────────────────────────────────────────────────────┘   │   SMS to restaurant
-        └──────────────────────────────────────────────────────────┘   header: RDLOTS
-```
+### 2.6 Page-weight budget (village mobile data is the constraint)
 
-Guarantees baked into this shape:
+Five images per card × a dozen visible cards is the real risk of this feature. Hard rules:
 
-1. **Only our cron can invoke it.** The `X-Cron-Secret` gate is identical to `expire-orders`; there is no user-facing path and `verify_jwt = false`.
-2. **The restaurant phone never leaves the server.** It is read server-side via the service-role client and used only as the SMS destination — never returned in the HTTP response and never written to logs (we log order/restaurant **IDs**, never phone numbers).
-3. **No double-send, no post-action send.** The claim-then-send pattern (§2.7) enforces both.
+- **Each uploaded image ≤ ~120 KB** (same budget the menu-image pipeline enforces; here it's enforced by you at upload time — compress before uploading, e.g. [squoosh.app](https://squoosh.app), WebP or JPEG, ~800×600 — matching the card's 4:3 aspect ratio).
+- **Only the first image loads eagerly-ish** (current `loading="lazy"` behaviour). Images 2–5 load lazily and the slideshow only runs while the card is actually visible (§6.2), so an off-screen card costs nothing extra.
+- Worst case fully-browsed page: ~5 restaurants × 5 × 120 KB ≈ 3 MB *only if the user keeps every card on screen long enough to cycle* — acceptable; typical cost is far lower because of visibility gating.
 
 ---
 
-## 5. Prerequisite Migration — `010_order_alert_sms.sql`
-
-### 5.1 What it does
-
-1. Adds `orders.owner_notified_at timestamptz` (nullable, default `NULL`) — the claim/idempotency marker (§2.7).
-2. Adds a **partial index** so the per-minute cron query stays O(few) forever: it indexes only rows that are `pending AND owner_notified_at IS NULL`. As soon as an order is claimed or leaves `pending`, it drops out of the index.
-
-No RLS change is required: the service-role client bypasses RLS, and no customer/owner query reads this column. (It would be harmless even if surfaced — it's just a timestamp.)
-
-### 5.2 SQL
+## 3. Migration (`011_restaurant_card_images.sql`)
 
 ```sql
--- ============================================================
--- 010_order_alert_sms.sql
--- Owner escalation alert: one-time SMS to the restaurant when an
--- order sits in 'pending' longer than ~1 minute without owner action.
---   (1) orders.owner_notified_at — claim / idempotency marker
---   (2) partial index to keep the per-minute cron SELECT + claim cheap
--- See src/docs/order_alert_sms_plan.md for the design.
--- Run this TENTH in Supabase SQL Editor (after 009_menu_image_rls_security_definer.sql)
--- ============================================================
+-- 011_restaurant_card_images.sql
+ALTER TABLE public.restaurants
+  ADD COLUMN image_urls text[] NOT NULL DEFAULT '{}'
+  CHECK (cardinality(image_urls) <= 5);
 
--- ── 1. orders.owner_notified_at ──────────────────────────────
--- Timestamp the alert pipeline finished handling this order:
--- set when the SMS is SENT, or when the order is PERMANENTLY
--- SKIPPED (restaurant has no valid phone). NULL = not yet handled.
--- notify-pending-orders "claims" an order by setting this column
--- with a conditional UPDATE *before* sending, so two overlapping
--- cron runs can never double-send and an order the owner just
--- acted on is never alerted.
-ALTER TABLE public.orders
-  ADD COLUMN owner_notified_at timestamptz;
+COMMENT ON COLUMN public.restaurants.image_urls IS
+  'Ordered card-slideshow images (max 5). Position 1 = lead image. '
+  'Admin-managed via Supabase Dashboard. Empty = frontend falls back to image_url.';
 
--- ── 2. Partial index for the cron query ──────────────────────
--- The cron selects pending, not-yet-notified orders past the age
--- cutoff every minute. This partial index holds only the handful
--- of rows in that state at any instant, so the SELECT and the
--- by-id claim stay fast regardless of total order volume.
-CREATE INDEX idx_orders_pending_alert
-  ON public.orders (created_at)
-  WHERE status = 'pending' AND owner_notified_at IS NULL;
+-- Optional, harmless backfill: seed the array from the existing single image
+UPDATE public.restaurants
+SET image_urls = ARRAY[image_url]
+WHERE image_url IS NOT NULL AND image_urls = '{}';
 ```
 
-### 5.3 Deploy notes
+After applying: regenerate types — `npx supabase gen types typescript --local` → `src/types/database.ts`. Also update `supabase/seed.sql` so the 5 seed restaurants carry 2–5 image URLs each (use the existing seed image URLs repeated/varied) — otherwise local dev never exercises the slideshow path.
 
-- **Apply order:** `001 → … → 009 → 010`. Additive only (new nullable column + index) — safe on a live table, no rewrite, no backfill. Existing pending rows get `owner_notified_at = NULL` and become immediately eligible (they'll be picked up on the next cron tick once the function is live — see the rollout note in §7, Step 4).
-- **Regenerate types:** `npx supabase gen types typescript --local > src/types/database.ts`. The new column will appear on the `orders` row type; nothing in the app reads it, but keep types fresh.
-- **Preview branches:** the Supabase↔GitHub integration applies this migration automatically on the PR's preview branch.
+No trigger, no function, no index — the column rides along on the existing `RestaurantList` select.
 
 ---
 
-## 6. The Edge Function — `notify-pending-orders`
+## 4. Image Sourcing & Storage (admin workflow)
 
-### 6.1 File
+One-time per restaurant, done by you:
 
-`supabase/functions/notify-pending-orders/index.ts` (new).
+1. **Bucket:** create (or reuse) a public bucket `restaurant-images` via the Supabase Dashboard. Public read, no anon/owner write — you upload through the Dashboard, which uses your admin session. (Unlike `menu-images`, this bucket needs **no** RLS policies for writes, because owners never write to it. Creating it via the Dashboard rather than a migration is acceptable for an admin-only bucket, but a one-line `INSERT INTO storage.buckets` in migration 011 keeps preview branches self-sufficient — prefer that.)
+2. **Layout:** `restaurant-images/{restaurant_id}/1.webp` … `5.webp`. The numeric names are convention only — order is defined by array position in `image_urls`, not by filename.
+3. **Compress before upload** (§2.6): 4:3 crop, ~800×600, ≤120 KB, WebP preferred.
+4. **Write the URLs:** in the Dashboard table editor, set `image_urls` to the ordered list of public URLs. Lead with the strongest photo — it's also what users with reduced-motion or a 1-image fallback will see.
 
-### 6.2 Reference implementation
+Legacy note: existing single images (in the old per-restaurant buckets) keep working untouched — either left in `image_url` as the fallback, or promoted into `image_urls[1]` by the backfill in §3.
 
-This mirrors `expire-orders` (cron auth + service-role client) and `send-otp` (MSG91 call + env handling). The Supabase client is untyped here, same as elsewhere in the repo, so the embedded `restaurant` relation is cast.
+---
+
+## 5. Frontend Implementation
+
+All changes live in `src/pages/restaurants/` — no routing, context, or shared-lib changes.
+
+### 5.1 `cardImages.ts` — pure helper (testable)
 
 ```ts
-// ============================================================
-// notify-pending-orders Edge Function
-// Sends ONE SMS alert to a restaurant when one of its orders has
-// been 'pending' longer than ALERT_AFTER_MINUTES without the owner
-// accepting/declining — i.e. the owner is away from the dashboard
-// and missed the in-app chime.
-//
-// Invocation: scheduled every minute via pg_cron (see §7 Step 4).
-// Auth: requires the X-Cron-Secret header to match CRON_SECRET.
-//
-// Idempotency (claim-then-send): each candidate order is "claimed"
-// with a conditional UPDATE of owner_notified_at BEFORE the SMS is
-// sent, so overlapping cron runs cannot double-send and an order the
-// owner just acted on is skipped (the claim filters status='pending').
-// Trade-off: a transient MSG91 outage skips that order's alert (no
-// retry). The in-app chime + 15-min expiry still apply. See §6.4.
-//
-// ── Deploy:
-//   supabase functions deploy notify-pending-orders --no-verify-jwt
-//
-// ── Schedule (run once in SQL Editor, after deploying): see §7 Step 4.
-// ============================================================
-
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-
-const MSG91_FLOW_URL = "https://control.msg91.com/api/v5/flow/";
-const PHONE_RE = /^[6-9]\d{9}$/;
-const ALERT_AFTER_MINUTES = 1;
-const BATCH_LIMIT = 50;
-
-Deno.serve(async (req) => {
-  // ── 1. Auth: only our pg_cron schedule may call this.
-  const providedSecret = req.headers.get("x-cron-secret");
-  const expectedSecret = Deno.env.get("CRON_SECRET");
-  if (!expectedSecret) return json({ error: "CRON_SECRET not configured" }, 500);
-  if (providedSecret !== expectedSecret) return json({ error: "unauthorized" }, 401);
-
-  // ── 2. Env.
-  const supabaseUrl = Deno.env.get("SUPABASE_URL");
-  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  const authKey = Deno.env.get("MSG91_AUTH_KEY");
-  const templateId = Deno.env.get("MSG91_ORDER_ALERT_TEMPLATE_ID");
-  if (!supabaseUrl || !serviceRoleKey || !authKey || !templateId) {
-    console.error("notify-pending-orders: missing env vars");
-    return json({ error: "server_misconfigured" }, 500);
-  }
-
-  const supabase = createClient(supabaseUrl, serviceRoleKey, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-
-  // ── 3. Find pending orders older than the threshold that have not
-  //       been alerted yet, with their restaurant's contact phone.
-  const cutoff = new Date(Date.now() - ALERT_AFTER_MINUTES * 60_000).toISOString();
-  const { data: candidates, error: selErr } = await supabase
-    .from("orders")
-    .select("id, restaurant:restaurants(id, name, phone)")
-    .eq("status", "pending")
-    .is("owner_notified_at", null)
-    .lte("created_at", cutoff)
-    .order("created_at", { ascending: true })
-    .limit(BATCH_LIMIT);
-
-  if (selErr) {
-    console.error("notify-pending-orders: select failed", selErr);
-    return json({ error: selErr.message }, 500);
-  }
-
-  let sent = 0;
-  let skippedNoPhone = 0;
-  let skippedClaimLost = 0;
-  let failed = 0;
-
-  for (const row of candidates ?? []) {
-    const restaurant = row.restaurant as unknown as
-      | { id: string; name: string; phone: string | null }
-      | null;
-
-    // ── 3a. CLAIM before sending: overlapping runs can't double-send,
-    //         and an order the owner just acted on is skipped.
-    const { data: claimed, error: claimErr } = await supabase
-      .from("orders")
-      .update({ owner_notified_at: new Date().toISOString() })
-      .eq("id", row.id)
-      .eq("status", "pending")
-      .is("owner_notified_at", null)
-      .select("id");
-
-    if (claimErr) {
-      console.error(`notify-pending-orders: claim failed for order ${row.id}`, claimErr);
-      failed++;
-      continue;
-    }
-    if (!claimed || claimed.length === 0) {
-      skippedClaimLost++; // owner acted, or another run claimed it first
-      continue;
-    }
-
-    // ── 3b. Resolve + validate the restaurant phone (10-digit Indian).
-    //         Tolerant of stored '+91'/spaces: strip non-digits, take last 10.
-    const digits = (restaurant?.phone ?? "").replace(/\D/g, "");
-    const mobile = digits.length > 10 ? digits.slice(-10) : digits;
-    if (!PHONE_RE.test(mobile)) {
-      // Permanently skipped. The claim is already set, so this logs ONCE
-      // (not every minute). Fix the restaurant row so future orders alert.
-      console.warn(
-        `notify-pending-orders: order ${row.id} restaurant ${restaurant?.id} ` +
-          `has no valid phone — alert skipped`,
-      );
-      skippedNoPhone++;
-      continue;
-    }
-
-    // ── 3c. Send the DLT-approved order-alert SMS via MSG91 Flow API.
-    //         Template has no variables, so recipients carry only `mobiles`.
-    let providerResp: Response;
-    try {
-      providerResp = await fetch(MSG91_FLOW_URL, {
-        method: "POST",
-        headers: {
-          authkey: authKey,
-          "Content-Type": "application/json",
-          accept: "application/json",
-        },
-        body: JSON.stringify({
-          template_id: templateId,
-          short_url: "0",
-          recipients: [{ mobiles: `91${mobile}` }],
-        }),
-      });
-    } catch (e) {
-      console.error(`notify-pending-orders: msg91 fetch failed for order ${row.id}`, e);
-      failed++;
-      continue;
-    }
-
-    const provider = await providerResp.json().catch(() => ({}));
-    if (!providerResp.ok || provider?.type !== "success") {
-      console.error(`notify-pending-orders: msg91 non-success for order ${row.id}`, {
-        status: providerResp.status,
-        type: provider?.type, // never log phone numbers
-      });
-      failed++;
-      continue;
-    }
-
-    sent++;
-  }
-
-  const summary = { sent, skippedNoPhone, skippedClaimLost, failed };
-  if (sent > 0 || failed > 0 || skippedNoPhone > 0) {
-    console.log("notify-pending-orders:", summary);
-  }
-  return json(summary);
-});
-
-function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
+export function getCardImages(r: { image_urls: string[]; image_url: string | null }): string[] {
+  if (r.image_urls.length > 0) return r.image_urls.slice(0, 5);
+  return r.image_url ? [r.image_url] : [];
 }
 ```
 
-### 6.3 Behaviour at a glance
+Lives next to `RestaurantList.tsx` (or in `src/lib/` if preferred); unit-tested per the v1 "pure logic only" testing rule (§8).
 
-| Candidate state at run time | Outcome |
-|---|---|
-| Still `pending`, ≥1 min old, valid restaurant phone | **SMS sent**, `owner_notified_at` set (`sent++`) |
-| Owner accepted/declined since the SELECT | Claim returns 0 rows → skipped (`skippedClaimLost++`) |
-| Restaurant phone null / not `^[6-9]\d{9}$` | Claimed (to stop re-logging) then **skipped**, one warning (`skippedNoPhone++`) |
-| MSG91 unreachable / non-`success` | Claimed, **no SMS**, error logged, **no retry** (`failed++`) — see §6.4 |
-| `created_at` < 1 min ago | Not selected this run; eligible next run |
-| Already `expired` / `accepted` / etc. | Not selected (`status != 'pending'`) |
+### 5.2 `RestaurantCardSlideshow.tsx` — new component
 
-### 6.4 Optional: retry-on-failure (v2-ready, one-line change)
+Replaces the `<img>/<placeholder>` block inside `.rlist__card-image`. Props: `{ images: string[]; alt: string }`.
 
-If you later want a transient MSG91 blip to retry on the next tick instead of being skipped, **un-claim on failure** — in the two failure branches (`fetch` throw and non-`success`), reset the marker before `continue`:
+- **0 images** → renders the existing `.rlist__card-image--placeholder` div.
+- **1 image** → renders today's single `<img loading="lazy">`. No timer, no dots, no observers — identical to current behaviour.
+- **2–5 images** → crossfade stack:
+  - All images absolutely positioned in the 4:3 box, `opacity: 0`, current slide `opacity: 1`, `transition: opacity 0.6s ease`. Crossfade (not a translating strip) because the card is small, the images are unrelated photos, and opacity transitions are cheap and don't fight the existing hover `scale(1.04)`.
+  - Non-current images get `loading="lazy"` and are `aria-hidden` (§6.1).
+  - `setInterval`-driven index advance at `SLIDE_INTERVAL_MS`, gated by §6.2's run conditions. Cleared on unmount.
+  - **Dot indicators** (small, bottom-right of the image area, above the gradient overlay): purely visual progress cue, `aria-hidden`, **not** buttons — they sit inside a `<Link>`, and clickable dots would recreate the tap-target conflict §2.1 resolved. Reuses the brand red for the active dot.
+  - Stagger the start of each card's timer by `idx * ~700ms` (the grid already staggers its entrance animation with `idx * 70ms`) so the whole grid doesn't flip in lockstep — synchronized flipping reads as glitchy and maximizes simultaneous image decode.
 
-```ts
-await supabase.from("orders")
-  .update({ owner_notified_at: null })
-  .eq("id", row.id)
-  .eq("status", "pending");   // don't un-claim an order that has since changed state
-```
+### 5.3 `RestaurantList.tsx` changes (minimal)
 
-This preserves the no-double-send guarantee (only one run holds the claim at a time) while allowing bounded retries until the order is accepted, declined, or expires at 15 min. Left out of the v1 reference to keep it simple; logged in §10.
+- Add `image_urls` to the select: `"id, name, cuisine_type, address, image_url, image_urls, lat, lng"` and to the `RestaurantRow` `Pick<…>`.
+- Swap the image block for `<RestaurantCardSlideshow images={getCardImages(r)} alt={r.name} />`.
+- Everything else — overlay gradient, distance pill, name, card body, Link semantics — unchanged.
 
-### 6.5 Config — `supabase/config.toml`
+`RestaurantMenu.tsx` is **not** touched (still renders the singular `image_url` in its header). Optionally point it at `getCardImages(...)[0]` later — v2 (§10).
 
-Add a block so the preview-branch bot deploys it (mirrors the `expire-orders` entry):
+### 5.4 CSS (`RestaurantList.css`)
 
-```toml
-[functions.notify-pending-orders]
-# Called by pg_cron via pg_net with an X-Cron-Secret header matching the
-# CRON_SECRET env var — never by a user JWT.
-verify_jwt = false
-```
+- New rules for the stacked slides + dots under the existing `.rlist__card-image` block; keep the 4:3 `aspect-ratio` container as the sizing source of truth.
+- Extend the existing `@media (prefers-reduced-motion: reduce)` block: kill the crossfade transition (slides cut instantly *if* they advance at all — see §6.1 for the stronger rule).
+
+---
+
+## 6. Accessibility & Performance
+
+### 6.1 Reduced motion & screen readers
+
+- **`prefers-reduced-motion: reduce` disables auto-play entirely** — the card shows the lead image statically (which is why §4 says lead with the strongest photo). Detect via `window.matchMedia` in the component, not CSS alone — CSS can hide the *transition* but only JS can stop the *content change*, and an auto-rotating image region is precisely what reduced-motion users opted out of.
+- The slideshow is **decorative**: one image carries `alt={restaurant name}` semantics; non-current slides and the dots are `aria-hidden`. No live-region announcements on slide change (that would spam screen readers every 3.5 s). The card's accessible name remains the visible `<h2>` restaurant name, as today.
+
+### 6.2 Run conditions — the timer only ticks when the slides can be seen
+
+Auto-play runs only when **all** of these hold; otherwise the interval is stopped (not merely skipped):
+
+1. **Card in viewport** — one `IntersectionObserver` per card (threshold ~0.5). Off-screen cards don't tick, don't fetch slides 2–5, don't decode.
+2. **Tab visible** — `document.visibilitychange`; backgrounded tabs stop (also prevents the browser-throttled-timer "catch-up burst" on return).
+3. **Not hovered** (desktop pause, §2.1).
+4. **Reduced motion not requested** (§6.1).
+
+This is the load-bearing performance guard for low-end phones: at any moment only the handful of on-screen cards animate, and lazy slides are fetched at most one card-screenful at a time.
+
+### 6.3 No layout shift
+
+Slides are absolutely positioned inside the fixed `aspect-ratio: 4/3` container, so the slideshow can never cause CLS regardless of image load order — same guarantee the current single image has.
 
 ---
 
 ## 7. Build Sequence
 
-Each step is independently verifiable. Do not skip ahead.
+1. **Migration 011** (§3) — column + CHECK + comment (+ optional bucket INSERT + backfill). Push on a feature branch; the Supabase↔GitHub integration applies it to the PR's preview branch.
+2. **Regen `database.ts`**; update `seed.sql` with multi-image seed data.
+3. **Helper + tests** — `getCardImages` (§5.1, §8).
+4. **`RestaurantCardSlideshow`** component + CSS (§5.2, §5.4), wired into `RestaurantList` (§5.3).
+5. **Manual verification:** 0/1/2/5-image cards render per §2.4 table; tap still navigates; hover pauses; backgrounding the tab stops timers (check via DevTools performance panel); reduced-motion (DevTools rendering emulation) shows a static lead image; throttled "Slow 4G" profile confirms slides 2–5 don't load for off-screen cards.
+6. **Production data pass:** create the bucket (if not in 011), upload + compress real photos, fill `image_urls` per restaurant (§4).
+7. **Docs:** update `CLAUDE.md` (route table `/restaurants` entry + file map) and mirror to `GEMINI.md`.
 
-### Step 1 — MSG91 secret + curl smoke test
-
-**Why first:** prove the auth key + internal template ID + `RDLOTS` header actually deliver a real SMS *before* writing function code, so any later failure is unambiguously a code bug, not provider misconfiguration.
-
-1. Create the Flow and record the internal template ID (§3.2).
-2. Add the new secret to the production Supabase project (and staging if separate). `MSG91_AUTH_KEY` and `CRON_SECRET` already exist from prior features — only the template ID is new:
-   ```bash
-   supabase secrets set \
-     MSG91_ORDER_ALERT_TEMPLATE_ID='<MSG91 internal Flow/template id from §3.2>' \
-     --project-ref <your-project-ref>
-   ```
-   Verify with `supabase secrets list --project-ref <ref>`.
-3. Smoke-test the Flow API against your own phone:
-   ```bash
-   curl -X POST 'https://control.msg91.com/api/v5/flow/' \
-     -H 'authkey: <MSG91_AUTH_KEY>' \
-     -H 'Content-Type: application/json' \
-     -H 'accept: application/json' \
-     -d '{
-       "template_id": "<MSG91 internal template id>",
-       "short_url": "0",
-       "recipients": [{ "mobiles": "91<YOUR_10_DIGIT_NUMBER>" }]
-     }'
-   ```
-   Expected: `{ "type": "success", "message": "<request id>" }` and the SMS arrives within ~10 s with header `RDLOTS` and the exact approved body.
-
-> **If MSG91 returns `success` but no SMS lands:** header/template mismatch on the Airtel DLT side. Check **MSG91 → Logs → SMS Logs** for the carrier delivery report. Do not proceed until a real SMS reaches a real device — sandbox success does not prove DLT delivery.
-
-**Testable output:** a real order-alert SMS on your phone, sent via the Flow API with the production auth key.
+Deploy outside the 12–2 PM / 7–9:30 PM peak windows, as always.
 
 ---
 
-### Step 2 — Apply migration `010_order_alert_sms.sql`
+## 8. Testing (v1 scope: pure logic only)
 
-1. Write the file (§5.2).
-2. Apply to staging / local first (`supabase db reset` or `supabase db push --project-ref <staging>`); confirm:
-   ```sql
-   \d public.orders                       -- owner_notified_at column present, nullable
-   SELECT indexname FROM pg_indexes
-   WHERE tablename = 'orders' AND indexname = 'idx_orders_pending_alert';
-   ```
-3. Apply to production: `supabase db push --project-ref <prod-ref>`.
-4. Regenerate types (§5.3).
-
-**Testable output:** `orders.owner_notified_at` exists and is `NULL` for all rows; the partial index exists.
+- `cardImages.test.ts` — `getCardImages`: empty array + null `image_url` → `[]`; empty array + legacy `image_url` → `[that]`; non-empty array wins over `image_url`; >5 entries truncated to 5 (defence in depth above the DB CHECK).
+- Timer/observer/visibility behaviour is **not** unit-tested (no mocked Supabase / no mocked browser-API rule of thumb in v1) — covered by the manual checklist in §7 Step 5.
 
 ---
 
-### Step 3 — Implement + deploy the function
+## 9. Edge Cases
 
-1. Create `supabase/functions/notify-pending-orders/index.ts` (§6.2) and the `config.toml` block (§6.5).
-2. Deploy (no JWT — it's cron-only):
-   ```bash
-   supabase functions deploy notify-pending-orders --no-verify-jwt --project-ref <ref>
-   ```
-3. Invoke it manually with the cron secret to dry-run the query path (it will alert any genuinely-stale pending orders, so do this when none exist, or accept a real SMS):
-   ```bash
-   curl -X POST 'https://<project-ref>.supabase.co/functions/v1/notify-pending-orders' \
-     -H 'X-Cron-Secret: <CRON_SECRET>' -H 'Content-Type: application/json'
-   # Expected: {"sent":0,"skippedNoPhone":0,"skippedClaimLost":0,"failed":0} on a quiet DB
-   ```
-4. Confirm the auth gate: the same call **without** the header returns `401 unauthorized`.
-
-**Testable output:** function returns a JSON summary; unauthorized calls are rejected.
-
----
-
-### Step 4 — Schedule the cron
-
-Run **once** in the Supabase SQL Editor after the function is deployed (mirrors the `expire-orders` schedule in that function's header comment):
-
-```sql
-select cron.schedule(
-  'notify-pending-orders-every-minute',
-  '* * * * *',
-  $$
-    select net.http_post(
-      url     := 'https://<project-ref>.supabase.co/functions/v1/notify-pending-orders',
-      headers := jsonb_build_object(
-        'Content-Type',  'application/json',
-        'X-Cron-Secret', '<CRON_SECRET>'
-      )
-    );
-  $$
-);
-```
-
-Verify and manage:
-```sql
-SELECT jobid, jobname, schedule, active FROM cron.job;          -- expire-orders + notify-pending-orders both listed
-SELECT * FROM cron.job_run_details ORDER BY start_time DESC LIMIT 10;  -- recent runs
--- To remove later: SELECT cron.unschedule('notify-pending-orders-every-minute');
-```
-
-> **Rollout note:** the instant this cron goes live, **every order already sitting in `pending` for >1 min with `owner_notified_at IS NULL` gets an SMS on the first tick.** Schedule it during a quiet window (avoid 12–2 PM / 7–9:30 PM peak per `CLAUDE.md`), and ideally when no orders are pending, so the first run doesn't fan out a burst of alerts for in-flight orders.
-
-**Testable output:** `cron.job` lists the new job as `active`; `cron.job_run_details` shows successful per-minute runs.
-
----
-
-### Step 5 — End-to-end test on a real device
-
-This is the only step that proves DLT delivery + the timing/idempotency logic together.
-
-| # | Scenario | Expected |
-|---|---|---|
-| 1 | Place a test order; **do nothing** for ~2 min | One SMS lands on `restaurants.phone` (~1–2 min); `orders.owner_notified_at` is now set |
-| 2 | Place a test order; **accept within 30 s** | **No SMS** (claim finds `status != 'pending'`); `owner_notified_at` stays `NULL` |
-| 3 | Let test order #1 keep sitting after the SMS | **No second SMS** (single-send) until 15-min expiry |
-| 4 | Order for a restaurant whose `phone` is null/invalid | **No SMS**; exactly **one** `skippedNoPhone` warning in function logs; `owner_notified_at` set |
-| 5 | Two pending orders for the **same** restaurant, both ignored | **Two** SMS (one per order — v1 behaviour, §10 notes coalescing as v2) |
-| 6 | Watch two adjacent cron ticks for one stale order | Exactly **one** SMS total (no double-send) |
-| 7 | Cost check | MSG91 wallet shows ~₹0.2 deducted per delivered alert |
-
-**Pre-launch gate:** do not consider this feature live until #1, #2, #3, and #6 pass on a physical phone with the production key.
-
----
-
-## 8. Security Considerations
-
-| Threat | Mitigation |
+| Case | Behaviour |
 |---|---|
-| Public / user invocation of the function | `X-Cron-Secret` gate identical to `expire-orders`; `verify_jwt = false` but the secret is required; no user-facing route |
-| MSG91 auth key leakage | Key lives only in Edge Function secrets; never in `import.meta.env` or any client-readable surface; never returned or logged |
-| Restaurant phone (internal/admin data) leaking | Read server-side via service role; **never** returned in the HTTP response; logs carry order/restaurant **IDs only**, never phone numbers |
-| Double-charge / SMS spam from overlapping runs | Claim-then-send conditional UPDATE (§2.7) — only one run can claim an order |
-| Alerting an order the owner already handled | Claim filters `status='pending'` — a handled order yields 0 rows and is skipped |
-| Stolen `CRON_SECRET` | Attacker could trigger extra runs, but the function is idempotent (claimed orders won't re-send) and only ever messages legitimately-pending orders' own restaurants. Rotate `CRON_SECRET` if suspected; it's a single secret shared with `expire-orders` |
-| Sending to an attacker-controlled number | Impossible — destination comes solely from `restaurants.phone` server-side; no client input reaches the function |
+| `image_urls = '{}'`, `image_url` set | Single static image (today's behaviour) — via fallback in `getCardImages` |
+| Both empty | Gradient placeholder, no timer |
+| One URL in the array 404s | That slide shows the browser broken-image state for its 3.5 s; the cycle continues. Optional hardening (v2): `onError` removes the failed slide from rotation |
+| Order placed/accepted etc. | Irrelevant — this feature never touches orders |
+| Dashboard edit sets >5 array entries | Rejected by the DB CHECK (`cardinality <= 5`) |
+| Realtime | Not subscribed — card images update on next page load. Deliberate: image changes are rare, admin-driven, and not worth a channel |
 
 ---
 
-## 9. Cost & Monitoring
+## 10. v2 Deferrals (log in `v2_deferred_issues.md` when shipped)
 
-- **Per-alert cost:** ~₹0.20–0.25. Confirm in **MSG91 → Wallet → Pricing**.
-- **Expected volume:** only ignored-for-a-minute orders. Pessimistically ~20/day early on → **~₹120/month** worst case; should taper as owners habituate. Negligible.
-- **Weekly glance:**
-  - **MSG91 → Logs → SMS Logs** — look for `Failed`/`Rejected` (DLT drift or carrier block).
-  - **Supabase → Edge Functions → notify-pending-orders → Logs** — the per-run `{ sent, skippedNoPhone, skippedClaimLost, failed }` summary. A non-zero **`skippedNoPhone`** means a restaurant is missing a valid `phone` (fix the row). A persistently non-zero **`failed`** means MSG91 trouble.
-  - **`cron.job_run_details`** — confirm the job is still firing every minute.
-- **Abuse / runaway signal:** if `sent` per day spikes far beyond order volume, inspect for a loop bug or a stuck-pending order that isn't expiring.
-
----
-
-## 10. v2 Deferrals (add to `src/docs/v2_deferred_issues.md`)
-
-1. **Retry-on-failure** — un-claim `owner_notified_at` in the failure branches so a transient MSG91 outage retries on the next tick (one-line change, §6.4). Deferred to keep v1 simple.
-2. **Repeat / escalation cadence** — a second nudge at, say, 5 min, or escalation to a different number. v1 sends exactly one SMS.
-3. **Owner `users.phone` as an additional/alternative recipient**, and **multiple alert numbers per restaurant** (owner + manager). v1 targets only `restaurants.phone`.
-4. **Per-restaurant coalescing** — if N orders pile up unconfirmed in the same window, send one "you have new orders" SMS instead of N. Needs a reworded DLT template (current copy is singular) and a different claim model.
-5. **Website-friendly DLT template** — re-approve copy without the word "app" (e.g. *"Open your RedLotus dashboard to confirm the order"*) and swap the Flow's template (§2.8).
-6. **WhatsApp escalation** — cheaper, richer, higher open-rate; requires Meta Business verification + template approval.
-7. **Presence-aware suppression** — skip the SMS if the owner's dashboard is provably active (would require presence tracking; not worth it for v1, where an occasional harmless SMS to a watching owner is fine).
-
----
-
-## Appendix A — Files Touched by This Plan
-
-```
-supabase/migrations/
-  └── 010_order_alert_sms.sql                    (new)
-
-supabase/functions/
-  └── notify-pending-orders/index.ts             (new)
-
-supabase/
-  └── config.toml                                (add [functions.notify-pending-orders])
-
-src/types/database.ts                            (regenerate — owner_notified_at column)
-
-src/docs/
-  ├── order_alert_sms_plan.md                    (this file)
-  └── v2_deferred_issues.md                      (add §10 entries)
-
-CLAUDE.md                                         (Hosting & env: list notify-pending-orders +
-                                                  MSG91_ORDER_ALERT_TEMPLATE_ID secret;
-                                                  Database: note orders.owner_notified_at;
-                                                  Owner dashboard: note SMS escalation)
-GEMINI.md                                         (mirror the CLAUDE.md change)
-```
-
-Manual one-time steps (not files):
-- MSG91 Dashboard — create the Flow, record the internal template ID (§3.2).
-- `supabase secrets set MSG91_ORDER_ALERT_TEMPLATE_ID=…` (§7 Step 1).
-- `cron.schedule('notify-pending-orders-every-minute', …)` in SQL Editor (§7 Step 4).
-- Audit `restaurants.phone` for all active restaurants (§2.1).
-
----
-
-## Appendix B — MSG91 Flow API Quick Reference
-
-> Verify exact field names against MSG91's live docs (`https://docs.msg91.com/`) before implementing; provider parameter names occasionally shift. Shapes below match the v5 Flow API as of this writing.
-
-```
-POST  https://control.msg91.com/api/v5/flow/
-      headers: authkey, Content-Type: application/json, accept: application/json
-      body:
-        {
-          "template_id": "<MSG91 internal Flow/template id>",   // NOT the DLT registry number
-          "short_url": "0",
-          "recipients": [
-            { "mobiles": "91XXXXXXXXXX" }                       // + var1/var2… only if template has variables
-          ]
-        }
-      success: { "type": "success", "message": "<request id>" }
-      failure: { "type": "error",   "message": "<reason>" }     // e.g. invalid template id
-```
-
-Contrast with the OTP API used by `send-otp` (`POST /api/v5/otp`) — different product, different ID, do not mix them up.
+- **Owner self-service photo upload** — "Restaurant photos" section in `/dashboard`, reusing the `menu-images` compression + `SECURITY DEFINER` RLS pattern (§2.2).
+- **Swipe gestures / tappable dots** — manual slide control needs a tap-target model that coexists with the card `<Link>` (§2.1, §5.2).
+- **`RestaurantMenu` header uses `image_urls[1]`** (§5.3).
+- **`onError` slide pruning** for dead URLs (§9).
+- **Per-image metadata** (captions, ordering UI) — would justify the `restaurant_images` table this plan rejected (§2.3).
