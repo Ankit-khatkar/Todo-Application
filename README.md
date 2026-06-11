@@ -29,8 +29,14 @@ The whole card is currently a single `<Link to={"/restaurants/" + id}>` (`Restau
 
 - Advance interval: **3.5 s** per slide (single constant, e.g. `SLIDE_INTERVAL_MS = 3500`).
 - Loops forever (`(i + 1) % images.length`).
-- Desktop hover **pauses** the slideshow (the card already has a hover scale effect; pausing while the user is inspecting the image is the expected behaviour).
+- Desktop hover **pauses** the slideshow (pausing while the user is inspecting the image is the expected behaviour).
 - Auto-play runs **only while the card is on-screen and the tab is visible** — see §6.2.
+
+### 2.1.1 Visual style — Zomato-like; **no frontend image scaling**
+
+The reference look is the Zomato restaurant card: a flat, clean photo carousel with dot indicators, no zoom effects on the image itself.
+
+**Decision:** the existing hover zoom — `.rlist__card:hover .rlist__card-image img { transform: scale(1.04) }` in `RestaurantList.css` — is **removed** as part of this feature. Images render flat at all times; the only image animation on the card is the slide crossfade. (This also deletes the matching `prefers-reduced-motion` override for that rule, which becomes dead CSS.) The card-level hover treatment (lift/shadow/border on `.rlist__card`) is untouched — only the image stops scaling.
 
 ### 2.2 Image management — admin only (Supabase Dashboard), no owner UI
 
@@ -131,7 +137,7 @@ Replaces the `<img>/<placeholder>` block inside `.rlist__card-image`. Props: `{ 
 - **0 images** → renders the existing `.rlist__card-image--placeholder` div.
 - **1 image** → renders today's single `<img loading="lazy">`. No timer, no dots, no observers — identical to current behaviour.
 - **2–5 images** → crossfade stack:
-  - All images absolutely positioned in the 4:3 box, `opacity: 0`, current slide `opacity: 1`, `transition: opacity 0.6s ease`. Crossfade (not a translating strip) because the card is small, the images are unrelated photos, and opacity transitions are cheap and don't fight the existing hover `scale(1.04)`.
+  - All images absolutely positioned in the 4:3 box, `opacity: 0`, current slide `opacity: 1`, `transition: opacity 0.6s ease`. Crossfade (not a translating strip) because the card is small, the images are unrelated photos, and opacity transitions are cheap. Slides never transform — no zoom, no parallax (§2.1.1).
   - Non-current images get `loading="lazy"` and are `aria-hidden` (§6.1).
   - `setInterval`-driven index advance at `SLIDE_INTERVAL_MS`, gated by §6.2's run conditions. Cleared on unmount.
   - **Dot indicators** (small, bottom-right of the image area, above the gradient overlay): purely visual progress cue, `aria-hidden`, **not** buttons — they sit inside a `<Link>`, and clickable dots would recreate the tap-target conflict §2.1 resolved. Reuses the brand red for the active dot.
@@ -148,6 +154,7 @@ Replaces the `<img>/<placeholder>` block inside `.rlist__card-image`. Props: `{ 
 ### 5.4 CSS (`RestaurantList.css`)
 
 - New rules for the stacked slides + dots under the existing `.rlist__card-image` block; keep the 4:3 `aspect-ratio` container as the sizing source of truth.
+- **Delete the hover zoom** (§2.1.1): remove `.rlist__card:hover .rlist__card-image img { transform: scale(1.04) }`, the `transition: transform 0.5s ease` on `.rlist__card-image img`, and the now-dead `prefers-reduced-motion` override for that selector.
 - Extend the existing `@media (prefers-reduced-motion: reduce)` block: kill the crossfade transition (slides cut instantly *if* they advance at all — see §6.1 for the stronger rule).
 
 ---
@@ -182,7 +189,7 @@ Slides are absolutely positioned inside the fixed `aspect-ratio: 4/3` container,
 2. **Regen `database.ts`**; update `seed.sql` with multi-image seed data.
 3. **Helper + tests** — `getCardImages` (§5.1, §8).
 4. **`RestaurantCardSlideshow`** component + CSS (§5.2, §5.4), wired into `RestaurantList` (§5.3).
-5. **Manual verification:** 0/1/2/5-image cards render per §2.4 table; tap still navigates; hover pauses; backgrounding the tab stops timers (check via DevTools performance panel); reduced-motion (DevTools rendering emulation) shows a static lead image; throttled "Slow 4G" profile confirms slides 2–5 don't load for off-screen cards.
+5. **Manual verification:** 0/1/2/5-image cards render per §2.4 table; tap still navigates; hover pauses the slideshow **and the image no longer zooms** (§2.1.1); backgrounding the tab stops timers (check via DevTools performance panel); reduced-motion (DevTools rendering emulation) shows a static lead image; throttled "Slow 4G" profile confirms slides 2–5 don't load for off-screen cards.
 6. **Production data pass:** create the bucket (if not in 011), upload + compress real photos, fill `image_urls` per restaurant (§4).
 7. **Docs:** update `CLAUDE.md` (route table `/restaurants` entry + file map) and mirror to `GEMINI.md`.
 
