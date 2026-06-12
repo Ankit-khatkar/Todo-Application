@@ -1,226 +1,463 @@
-# Restaurant Card Image Slideshow — Build Plan
+# Customer Order Cancellation + Owner-Set Delivery ETA — Build Plan
 
-> **Status:** Planned — nothing implemented yet. This document is the agreed design.
-> **Duration:** ~1 day (migration + frontend) + ongoing admin time to photograph/upload images per restaurant.
-> **Goal:** Each restaurant card on `/restaurants` shows up to **5 images** that auto-advance as a slideshow, instead of today's single static `image_url`. Tapping the card keeps navigating to the menu, exactly as it does now.
-> **Prerequisites:**
-> - None technical — this is a self-contained schema tweak + frontend feature on the existing `restaurants` table and `RestaurantList.tsx`.
-> - Operationally: real photos per restaurant (interior, signature dishes, storefront). The feature degrades gracefully without them (§2.4), so it can ship before all photos exist.
-
----
-
-## 1. Why This Feature Exists
-
-The restaurant card is the customer's first impression of a restaurant — and right now it carries exactly one image (or a flat gradient placeholder). One photo can't show a storefront *and* the food *and* the seating. Five rotating photos let each restaurant present a richer storefront on the list page, which is where the order funnel starts.
-
-This is a conversion play on the highest-traffic authenticated page in the app, at near-zero ongoing cost (no new services, no Edge Functions, no cron).
+> **Status:** Design — not started. Two independent features, planned together because they both live on the `pending → accepted` boundary and touch the same files (`OrderStatus.tsx`, `OwnerDashboard.tsx`, the status-transition trigger).
+> **Duration:** ~1 day each (migration + frontend + tests). They can ship as two separate PRs in either order — see §8 rollout notes.
+> **Goal:**
+> 1. **Customer cancellation** — a customer can cancel their own order **while it is still `pending`** (i.e. before the restaurant accepts). After acceptance, no cancellation — unchanged from v1.
+> 2. **Delivery ETA** — when the owner accepts an order they pick a time duration ("this order will reach the customer in ~X minutes"); the customer's `/orders/:id` page shows that promise as an arrival window so they know when food is coming.
+> **Prerequisites:** none technical — both are schema tweaks + frontend on existing tables/pages. No new services, no new Edge Functions, no new cron.
 
 ---
 
-## 2. Decisions & Constraints
+## 1. Why These Features Exist
 
-These are settled (discussed and confirmed 2026-06-11). Each is load-bearing on the implementation below.
+**Cancellation.** Today the customer's only path out of a mis-placed order (wrong restaurant, fat-fingered quantity, changed their mind) is calling the restaurant or waiting 15 minutes for auto-expiry. That's bad for both sides: the customer feels trapped, and the owner gets a chime + possibly an SMS for an order the customer never wanted. The key insight that makes this safe in v1: **`pending` means the restaurant has not accepted and has not started cooking.** Cancelling a pending order costs the restaurant nothing. That's why the line is drawn exactly there — see §2.1.
 
-### 2.1 Interaction — auto-play; tap keeps navigating to the menu
-
-The whole card is currently a single `<Link to={"/restaurants/" + id}>` (`RestaurantList.tsx`). The original idea — *"tap on the slide to start the slide"* — conflicts with that: a tap that starts the slideshow can't also open the menu, and splitting the tap target (image vs. card body) or requiring two taps both add friction right where customers decide to order.
-
-**Decision:** the slideshow **auto-plays** (no tap needed), and **tapping anywhere on the card navigates to the menu, unchanged.** No dead taps, no behaviour change to the funnel, no new tap targets inside a `<Link>`.
-
-- Advance interval: **3.5 s** per slide (single constant, e.g. `SLIDE_INTERVAL_MS = 3500`).
-- Loops forever (`(i + 1) % images.length`).
-- Desktop hover **pauses** the slideshow (pausing while the user is inspecting the image is the expected behaviour).
-- Auto-play runs **only while the card is on-screen and the tab is visible** — see §6.2.
-
-### 2.1.1 Visual style — Zomato-like; **no frontend image scaling**
-
-The reference look is the Zomato restaurant card: a flat, clean photo carousel with dot indicators, no zoom effects on the image itself.
-
-**Decision:** the existing hover zoom — `.rlist__card:hover .rlist__card-image img { transform: scale(1.04) }` in `RestaurantList.css` — is **removed** as part of this feature. Images render flat at all times; the only image animation on the card is the slide crossfade. (This also deletes the matching `prefers-reduced-motion` override for that rule, which becomes dead CSS.) The card-level hover treatment (lift/shadow/border on `.rlist__card`) is untouched — only the image stops scaling.
-
-### 2.2 Image management — admin only (Supabase Dashboard), no owner UI
-
-You (Ankit) upload images to Storage and write the URLs into the new column from the Supabase Dashboard — the same way restaurants are onboarded today. **No owner-facing upload UI in this version.** This keeps the scope to one migration + one component; the owner self-service version (reusing the menu-image upload/compression/RLS pattern from `/dashboard/menu`) is logged as a v2 item (§10).
-
-### 2.3 Data model — `restaurants.image_urls text[]`, ordered, max 5
-
-A new column on `restaurants`, not a separate table:
-
-- `image_urls text[] NOT NULL DEFAULT '{}'` — array position **is** the display order; first element is the lead image.
-- `CHECK (cardinality(image_urls) <= 5)` — the 5-image cap lives in the DB, not just in UI convention.
-- **`image_url` (singular) stays untouched.** `RestaurantMenu.tsx` still reads it for the menu-page header, and it remains the fallback for cards whose `image_urls` is empty (§2.4). No drop, no rename, no backfill required — though backfilling `image_urls = ARRAY[image_url]` for rows that have one is a harmless optional step (§3).
-
-Why not a `restaurant_images` table: per-image metadata (captions, per-image RLS, owner uploads) is exactly the v2 feature set we deferred. For "an ordered list of up to 5 public URLs managed by one admin," an array column is one migration, zero new RLS policies, and one fewer join on the hottest customer query.
-
-### 2.4 Count — *up to* 5; graceful degradation below that
-
-5 is a **cap, not a requirement**. The card derives its image list and picks a rendering mode:
-
-| Images available | Card renders |
-|---|---|
-| 0 (and no legacy `image_url`) | Gradient placeholder, as today |
-| 1 | Static image, as today — **no slideshow chrome, no timer, no dots** |
-| 2–5 | Auto-playing slideshow + dot indicators |
-
-Derivation rule (single helper, see §5.1): `image_urls` when non-empty, else `[image_url]` when set, else `[]`. This means the feature ships safely with **zero data work** — every existing restaurant just keeps its current single image until you upload more.
-
-### 2.5 No RLS or security changes
-
-`image_urls` is just another column on `restaurants`; the existing customer SELECT policy (`is_active AND is_open`) already covers it. Writes happen via the Supabase Dashboard (service role / admin), so no new write policy is needed. The storage bucket is public-read like the existing image buckets (§4).
-
-### 2.6 Page-weight budget (village mobile data is the constraint)
-
-Five images per card × a dozen visible cards is the real risk of this feature. Hard rules:
-
-- **Each uploaded image ≤ ~120 KB** (same budget the menu-image pipeline enforces; here it's enforced by you at upload time — compress before uploading, e.g. [squoosh.app](https://squoosh.app), WebP or JPEG, ~800×600 — matching the card's 4:3 aspect ratio).
-- **Only the first image loads eagerly-ish** (current `loading="lazy"` behaviour). Images 2–5 load lazily and the slideshow only runs while the card is actually visible (§6.2), so an off-screen card costs nothing extra.
-- Worst case fully-browsed page: ~5 restaurants × 5 × 120 KB ≈ 3 MB *only if the user keeps every card on screen long enough to cycle* — acceptable; typical cost is far lower because of visibility gating.
+**ETA.** Today the customer's status page says *"Order confirmed! The restaurant is getting ready."* with no time attached. The customer has no idea whether food is 15 or 60 minutes away, which drives "where is my order" phone calls straight to the restaurant (the only phone number the customer has is their own order history... so in practice to Ankit on WhatsApp). A visible owner-made promise ("arriving in 30–40 min") is the single highest-leverage trust signal on the order-status page, and it costs the owner one extra tap at accept time.
 
 ---
 
-## 3. Migration (`011_restaurant_card_images.sql`)
+## 2. Feature A — Customer Cancellation of Pending Orders
+
+### 2.1 Decisions & constraints
+
+#### 2.1.1 Pending-only — a clean, explainable rule
+
+Cancellation is allowed **only while `status = 'pending'`**. The moment the owner accepts, the kitchen may have started and ingredients are committed — from `accepted` onward, no cancellation (call the restaurant / Ankit for exceptions, exactly as today). This is the rule customers intuitively expect ("I can take it back until the restaurant says yes") and it's the rule that costs restaurants nothing. A grace window after acceptance was considered and rejected for v1 — it reopens the food-waste problem the no-cancellation rule existed to prevent. Logged as a v2 idea (§9).
+
+#### 2.1.2 New enum value `cancelled` — not a reuse of `declined`
+
+`declined` is an owner action with a mandatory reason; reusing it with a synthetic reason ("Cancelled by customer") would corrupt owner-facing history, decline analytics, and the `decline_reason_required` CHECK's meaning. A distinct terminal status keeps every surface honest:
+
+```
+pending → accepted → preparing → out_for_delivery → completed
+pending → declined   (owner, with reason)
+pending → expired    (cron, after 15 min)
+pending → cancelled  (customer)            ← NEW
+```
+
+`cancelled` is terminal. No backward transitions, no resurrection.
+
+#### 2.1.3 No cancellation reason in v1
+
+The owner hasn't started anything, so the customer owes no explanation. No new text column, no extra modal field, no validation. If cancellation-rate analytics later show abuse, a reason field (or rate limiting, §9) can be added then.
+
+#### 2.1.4 No new timestamp column
+
+`updated_at` already captures when the cancellation happened (the status flip is the last write to a cancelled order). Same reasoning as `declined`/`expired`, which also have no dedicated timestamps.
+
+#### 2.1.5 RPC, **not** a customer UPDATE RLS policy
+
+Customers currently have **no UPDATE policy on `orders`** — and that must stay true. RLS can restrict *which rows* a user may update but not *which columns or values*, so a naive `orders_customer_update` policy would let a customer:
+
+- set `status = 'accepted'` on their own order (the transition trigger allows `pending → accepted` regardless of actor) — fake-accepting to dodge the 15-min expiry and the SMS backstop;
+- set `status = 'declined'` with a fabricated reason, impersonating the restaurant;
+- rewrite `delivery_address` / `special_instructions` after the owner has seen the card.
+
+**Decision:** cancellation goes through a `cancel_order(p_order_id uuid)` SECURITY DEFINER RPC — the same pattern as `place_order`. The RPC bypasses RLS (customers keep zero direct UPDATE grants) and enforces ownership + state in its own `WHERE` clause. Atomicity and races come free from the conditional UPDATE (§2.1.6).
+
+#### 2.1.6 Race handling — the same conditional-UPDATE pattern the dashboard already uses
+
+Three actors can touch a pending order at the same instant: the customer (cancel), the owner (accept/decline), and the cron (expire). All three already/will use `UPDATE … WHERE status = 'pending'`, so Postgres row locking serialises them — whoever commits first wins, everyone else matches 0 rows:
+
+| Race | Winner behaviour | Loser behaviour |
+|---|---|---|
+| Customer cancels vs owner accepts | First commit wins | Owner: existing *"This order is no longer pending. Refreshing…"* toast + refetch. Customer: RPC returns `false` → *"The restaurant has already accepted your order."* + refetch shows live status. |
+| Customer cancels vs owner declines | Same | Same pattern on both sides. |
+| Customer cancels vs cron expires | Same | Customer who loses to the cron sees the expired state — functionally identical outcome for them. |
+
+No new locking machinery, no advisory locks, nothing clever.
+
+#### 2.1.7 Defence-in-depth: the transition trigger checks the actor
+
+Allowing `pending → cancelled` in `enforce_status_transition()` alone would let an **owner** (who *does* have an UPDATE policy on their restaurant's orders) set `cancelled` — sidestepping the mandatory decline reason while making it look customer-initiated. The trigger therefore gates the new transition on the actor:
+
+`NEW.status = 'cancelled'` is allowed only when `auth.uid() = OLD.customer_id`. `auth.uid()` reads the JWT claims, so it still returns the customer's id inside the SECURITY DEFINER RPC — the legitimate path passes, the owner path raises. (Admin/service-role sessions have no JWT `sub` matching the customer; if Ankit ever needs to force-cancel, the Supabase Dashboard runs as a true superuser session where the trigger can be worked around deliberately — acceptable for a sole-admin v1.)
+
+#### 2.1.8 Interplay with the SMS backstop and expiry cron — zero changes needed
+
+- `expire-orders` only touches `status = 'pending'` rows — a cancelled order naturally drops out of its window.
+- `notify-pending-orders` claims via `status = 'pending' AND owner_notified_at IS NULL` — cancel **before** the ~1-min alert and no SMS is ever sent (a genuine win: instant-regret cancellations stop pinging owners). Cancel **after** the SMS went out and the owner gets a text for an order that's gone — they open the dashboard and find it in Today's History as *Cancelled*. Mildly annoying, inherent to any alert-then-cancel ordering, accepted for v1.
+- `owner_notified_at` semantics are untouched.
+
+#### 2.1.9 Owner dashboard must learn the new status (Realtime)
+
+The dashboard's Realtime UPDATE handler currently routes `expired`, active statuses, and `completed`/`declined`. An unrecognised `cancelled` payload would match **no branch — the pending card would sit on screen as a ghost** until reload. The handler gets a `cancelled` branch that mirrors `expired` (remove from pending, snapshot into Today's History), plus a toast — unlike silent cron expiry, a cancellation can land seconds before the owner taps Accept, so an explicit *"Order cancelled by the customer."* heads off confusion. `HISTORY_STATUSES` and `historyStatusLabel` gain `cancelled` accordingly.
+
+### 2.2 Migrations
+
+**Two files, not one.** `ALTER TYPE … ADD VALUE` commits fine inside a migration's transaction (PG 12+), but the new value **cannot be referenced by parsed SQL in the same transaction** — Postgres raises *"unsafe use of new value"* for policies, CHECK constraints, or partial-index predicates that mention it. plpgsql function bodies escape this (they're stored as strings, parsed at runtime), but splitting is the rule that never bites: enum addition in its own migration, everything that uses the value in the next.
+
+#### `012_order_status_cancelled.sql`
 
 ```sql
--- 011_restaurant_card_images.sql
-ALTER TABLE public.restaurants
-  ADD COLUMN image_urls text[] NOT NULL DEFAULT '{}'
-  CHECK (cardinality(image_urls) <= 5);
+-- ============================================================
+-- 012_order_status_cancelled.sql
+-- Adds the 'cancelled' terminal status (customer-initiated).
+-- MUST be its own migration: a new enum value cannot be referenced
+-- by parsed SQL (policies / CHECKs / index predicates) in the same
+-- transaction that adds it. 013 holds everything that uses it.
+-- See src/docs/customer_cancellation_and_eta_plan.md for the design.
+-- ============================================================
 
-COMMENT ON COLUMN public.restaurants.image_urls IS
-  'Ordered card-slideshow images (max 5). Position 1 = lead image. '
-  'Admin-managed via Supabase Dashboard. Empty = frontend falls back to image_url.';
-
--- Optional, harmless backfill: seed the array from the existing single image
-UPDATE public.restaurants
-SET image_urls = ARRAY[image_url]
-WHERE image_url IS NOT NULL AND image_urls = '{}';
+ALTER TYPE public.order_status ADD VALUE IF NOT EXISTS 'cancelled';
 ```
 
-After applying: regenerate types — `npx supabase gen types typescript --local` → `src/types/database.ts`. Also update `supabase/seed.sql` so the 5 seed restaurants carry 2–5 image URLs each (use the existing seed image URLs repeated/varied) — otherwise local dev never exercises the slideshow path.
+#### `013_customer_cancellation.sql`
 
-No trigger, no function, no index — the column rides along on the existing `RestaurantList` select.
+```sql
+-- ============================================================
+-- 013_customer_cancellation.sql
+--   (1) enforce_status_transition: allow pending → cancelled,
+--       customer-actor-gated (defence-in-depth vs owner misuse)
+--   (2) cancel_order RPC — the ONLY cancellation path; customers
+--       keep zero direct UPDATE grants on orders
+-- See src/docs/customer_cancellation_and_eta_plan.md.
+-- ============================================================
 
----
+-- ── 1. Status transition trigger v2 ──────────────────────────
+-- Adds pending → cancelled, allowed only when the JWT subject is
+-- the order's customer. auth.uid() still resolves to the customer
+-- inside the SECURITY DEFINER cancel_order RPC (it reads claims,
+-- not the function owner), so the legitimate path passes while an
+-- owner-session UPDATE to 'cancelled' raises.
 
-## 4. Image Sourcing & Storage (admin workflow)
+CREATE OR REPLACE FUNCTION public.enforce_status_transition()
+RETURNS trigger AS $$
+BEGIN
+  IF OLD.status = NEW.status THEN
+    RETURN NEW;
+  END IF;
 
-One-time per restaurant, done by you:
+  IF (OLD.status = 'pending'          AND NEW.status IN ('accepted', 'declined', 'expired'))
+  OR (OLD.status = 'accepted'         AND NEW.status = 'preparing')
+  OR (OLD.status = 'preparing'        AND NEW.status = 'out_for_delivery')
+  OR (OLD.status = 'out_for_delivery' AND NEW.status = 'completed')
+  THEN
+    RETURN NEW;
+  END IF;
 
-1. **Bucket:** create (or reuse) a public bucket `restaurant-images` via the Supabase Dashboard. Public read, no anon/owner write — you upload through the Dashboard, which uses your admin session. (Unlike `menu-images`, this bucket needs **no** RLS policies for writes, because owners never write to it. Creating it via the Dashboard rather than a migration is acceptable for an admin-only bucket, but a one-line `INSERT INTO storage.buckets` in migration 011 keeps preview branches self-sufficient — prefer that.)
-2. **Layout:** `restaurant-images/{restaurant_id}/1.webp` … `5.webp`. The numeric names are convention only — order is defined by array position in `image_urls`, not by filename.
-3. **Compress before upload** (§2.6): 4:3 crop, ~800×600, ≤120 KB, WebP preferred.
-4. **Write the URLs:** in the Dashboard table editor, set `image_urls` to the ordered list of public URLs. Lead with the strongest photo — it's also what users with reduced-motion or a 1-image fallback will see.
+  -- Customer cancellation: pending only, customer actor only.
+  IF OLD.status = 'pending' AND NEW.status = 'cancelled' THEN
+    IF auth.uid() = OLD.customer_id THEN
+      RETURN NEW;
+    END IF;
+    RAISE EXCEPTION 'Only the customer can cancel an order';
+  END IF;
 
-Legacy note: existing single images (in the old per-restaurant buckets) keep working untouched — either left in `image_url` as the fallback, or promoted into `image_urls[1]` by the backfill in §3.
+  RAISE EXCEPTION 'Invalid status transition from % to %', OLD.status, NEW.status;
+END;
+$$ LANGUAGE plpgsql;
 
----
+-- Trigger object already exists (003); CREATE OR REPLACE of the
+-- function is sufficient — do not re-create the trigger.
 
-## 5. Frontend Implementation
+-- ── 2. cancel_order RPC ──────────────────────────────────────
+-- Mirrors place_order: SECURITY DEFINER so no customer UPDATE
+-- policy is ever added to orders. Ownership + state live in the
+-- WHERE clause; the conditional UPDATE is the race guard (same
+-- pattern as the owner dashboard's accept/decline).
+-- Returns true on success, false on a lost race (already
+-- accepted / declined / expired) — the frontend maps false to
+-- "The restaurant has already accepted your order." + refetch.
 
-All changes live in `src/pages/restaurants/` — no routing, context, or shared-lib changes.
+CREATE OR REPLACE FUNCTION public.cancel_order(p_order_id uuid)
+RETURNS boolean AS $$
+DECLARE
+  v_updated integer;
+BEGIN
+  UPDATE public.orders
+  SET status = 'cancelled'
+  WHERE id = p_order_id
+    AND customer_id = auth.uid()
+    AND status = 'pending';
 
-### 5.1 `cardImages.ts` — pure helper (testable)
-
-```ts
-export function getCardImages(r: { image_urls: string[]; image_url: string | null }): string[] {
-  if (r.image_urls.length > 0) return r.image_urls.slice(0, 5);
-  return r.image_url ? [r.image_url] : [];
-}
+  GET DIAGNOSTICS v_updated = ROW_COUNT;
+  RETURN v_updated = 1;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
 ```
 
-Lives next to `RestaurantList.tsx` (or in `src/lib/` if preferred); unit-tested per the v1 "pure logic only" testing rule (§8).
+After applying: regenerate types (`npx supabase gen types typescript --local` → `src/types/database.ts`) so the `order_status` enum gains `'cancelled'`. Until regen lands, the placeholder enum in `database.ts` must be edited by hand — `OrderStatus` in `models.ts` derives from it.
 
-### 5.2 `RestaurantCardSlideshow.tsx` — new component
+### 2.3 Frontend — customer side
 
-Replaces the `<img>/<placeholder>` block inside `.rlist__card-image`. Props: `{ images: string[]; alt: string }`.
+All changes in `src/pages/orders/` plus one new modal component.
 
-- **0 images** → renders the existing `.rlist__card-image--placeholder` div.
-- **1 image** → renders today's single `<img loading="lazy">`. No timer, no dots, no observers — identical to current behaviour.
-- **2–5 images** → crossfade stack:
-  - All images absolutely positioned in the 4:3 box, `opacity: 0`, current slide `opacity: 1`, `transition: opacity 0.6s ease`. Crossfade (not a translating strip) because the card is small, the images are unrelated photos, and opacity transitions are cheap. Slides never transform — no zoom, no parallax (§2.1.1).
-  - Non-current images get `loading="lazy"` and are `aria-hidden` (§6.1).
-  - `setInterval`-driven index advance at `SLIDE_INTERVAL_MS`, gated by §6.2's run conditions. Cleared on unmount.
-  - **Dot indicators** (small, bottom-right of the image area, above the gradient overlay): purely visual progress cue, `aria-hidden`, **not** buttons — they sit inside a `<Link>`, and clickable dots would recreate the tap-target conflict §2.1 resolved. Reuses the brand red for the active dot.
-  - Stagger the start of each card's timer by `idx * ~700ms` (the grid already staggers its entrance animation with `idx * 70ms`) so the whole grid doesn't flip in lockstep — synchronized flipping reads as glitchy and maximizes simultaneous image decode.
+**`OrderStatus.tsx`**
+- `STATUS_MESSAGES` gains `cancelled: "You cancelled this order."` and `TERMINAL` gains `"cancelled"`. The status card renders it neutrally (customer's own action — **not** the red error treatment used for `declined`/`expired`), with a *"Order again"* link to `/restaurants` mirroring the expired-state CTA.
+- While `status === 'pending'`, render a **"Cancel order"** button (ghost/danger style) under the status card, with helper copy: *"You can cancel until the restaurant accepts."*
+- Clicking opens **`CancelOrderModal`** (new, co-located) mirroring `ConfirmOrderModal` / `DeclineModal` patterns exactly: focus restoration, ESC, backdrop click, body scroll lock, errors rendered inside the modal. **Default focus on "Keep my order"** — the same fat-finger-Enter defence `ConfirmOrderModal` uses, pointed the safe way.
+- Confirm handler: `supabase.rpc('cancel_order', { p_order_id: id })`.
+  - `data === true` → optimistically set local `status = 'cancelled'`, close modal. The Realtime UPDATE echo merges the same value — idempotent.
+  - `data === false` → lost race. Show *"The restaurant has already accepted your order."* inside the modal (or as the close-out message) and refetch the order so the page reflects the live status.
+  - Error → `humaniseSupabaseError`, rendered inside the modal so retry doesn't require reopening (same rule as `ConfirmOrderModal`).
+- The page already subscribes to Realtime UPDATEs and spreads `payload.new` — a cancellation made in another tab flips this page with no extra work. The button must be derived from `order.status` (it is, by construction) so it disappears the instant the status leaves `pending` for *any* reason.
 
-### 5.3 `RestaurantList.tsx` changes (minimal)
+**`OrderHistory.tsx`** — `badgeClass` gains a `cancelled` case. Use a new neutral grey badge class (`ohist__badge--neutral`), not the red error class: a cancellation is the customer's own action, not a failure.
 
-- Add `image_urls` to the select: `"id, name, cuisine_type, address, image_url, image_urls, lat, lng"` and to the `RestaurantRow` `Pick<…>`.
-- Swap the image block for `<RestaurantCardSlideshow images={getCardImages(r)} alt={r.name} />`.
-- Everything else — overlay gradient, distance pill, name, card body, Link semantics — unchanged.
+**`Checkout.tsx` / `ConfirmOrderModal.tsx`** (copy only) — the confirm modal's framing can now soften: a line like *"You can still cancel before the restaurant accepts."* The modal's place as the deliberate-click safety net is unchanged; cancellation is a second net, not a replacement.
 
-`RestaurantMenu.tsx` is **not** touched (still renders the singular `image_url` in its header). Optionally point it at `getCardImages(...)[0]` later — v2 (§10).
+### 2.4 Frontend — owner dashboard
 
-### 5.4 CSS (`RestaurantList.css`)
+All changes in `src/pages/dashboard/`.
 
-- New rules for the stacked slides + dots under the existing `.rlist__card-image` block; keep the 4:3 `aspect-ratio` container as the sizing source of truth.
-- **Delete the hover zoom** (§2.1.1): remove `.rlist__card:hover .rlist__card-image img { transform: scale(1.04) }`, the `transition: transform 0.5s ease` on `.rlist__card-image img`, and the now-dead `prefers-reduced-motion` override for that selector.
-- Extend the existing `@media (prefers-reduced-motion: reduce)` block: kill the crossfade transition (slides cut instantly *if* they advance at all — see §6.1 for the stronger rule).
-
----
-
-## 6. Accessibility & Performance
-
-### 6.1 Reduced motion & screen readers
-
-- **`prefers-reduced-motion: reduce` disables auto-play entirely** — the card shows the lead image statically (which is why §4 says lead with the strongest photo). Detect via `window.matchMedia` in the component, not CSS alone — CSS can hide the *transition* but only JS can stop the *content change*, and an auto-rotating image region is precisely what reduced-motion users opted out of.
-- The slideshow is **decorative**: one image carries `alt={restaurant name}` semantics; non-current slides and the dots are `aria-hidden`. No live-region announcements on slide change (that would spam screen readers every 3.5 s). The card's accessible name remains the visible `<h2>` restaurant name, as today.
-
-### 6.2 Run conditions — the timer only ticks when the slides can be seen
-
-Auto-play runs only when **all** of these hold; otherwise the interval is stopped (not merely skipped):
-
-1. **Card in viewport** — one `IntersectionObserver` per card (threshold ~0.5). Off-screen cards don't tick, don't fetch slides 2–5, don't decode.
-2. **Tab visible** — `document.visibilitychange`; backgrounded tabs stop (also prevents the browser-throttled-timer "catch-up burst" on return).
-3. **Not hovered** (desktop pause, §2.1).
-4. **Reduced motion not requested** (§6.1).
-
-This is the load-bearing performance guard for low-end phones: at any moment only the handful of on-screen cards animate, and lazy slides are fetched at most one card-screenful at a time.
-
-### 6.3 No layout shift
-
-Slides are absolutely positioned inside the fixed `aspect-ratio: 4/3` container, so the slideshow can never cause CLS regardless of image load order — same guarantee the current single image has.
+- **`utils.ts`** — `HISTORY_STATUSES` gains `"cancelled"`; `historyStatusLabel` returns `{ label: "Cancelled", variant: "neutral" }` for it.
+- **`OwnerDashboard.tsx`** Realtime UPDATE handler — extend the existing `expired` branch to `status === "expired" || status === "cancelled"` (identical mechanics: find in `pendingOrdersRef`, snapshot into `HistoryOrder`, remove from pending). For `cancelled` only, additionally `showToast("warning", "Order cancelled by the customer.")` — the owner may be looking straight at the card when it vanishes.
+- **No changes** to `handleAccept` / `handleDeclineConfirm` — their 0-row race path already covers "customer cancelled first" via the generic *"no longer pending"* toast + refetch.
+- **`HistorySection`** — renders the new label/variant; no structural change.
 
 ---
 
-## 7. Build Sequence
+## 3. Feature B — Owner-Set Delivery ETA
 
-1. **Migration 011** (§3) — column + CHECK + comment (+ optional bucket INSERT + backfill). Push on a feature branch; the Supabase↔GitHub integration applies it to the PR's preview branch.
-2. **Regen `database.ts`**; update `seed.sql` with multi-image seed data.
-3. **Helper + tests** — `getCardImages` (§5.1, §8).
-4. **`RestaurantCardSlideshow`** component + CSS (§5.2, §5.4), wired into `RestaurantList` (§5.3).
-5. **Manual verification:** 0/1/2/5-image cards render per §2.4 table; tap still navigates; hover pauses the slideshow **and the image no longer zooms** (§2.1.1); backgrounding the tab stops timers (check via DevTools performance panel); reduced-motion (DevTools rendering emulation) shows a static lead image; throttled "Slow 4G" profile confirms slides 2–5 don't load for off-screen cards.
-6. **Production data pass:** create the bucket (if not in 011), upload + compress real photos, fill `image_urls` per restaurant (§4).
-7. **Docs:** update `CLAUDE.md` (route table `/restaurants` entry + file map) and mirror to `GEMINI.md`.
+### 3.1 Decisions & constraints
 
-Deploy outside the 12–2 PM / 7–9:30 PM peak windows, as always.
+#### 3.1.1 The duration means **time to the customer's door**, not kitchen prep time
+
+Restaurants handle their own delivery (v1 business rule), and the customer cares about one number: *when does food arrive*. An owner-facing "prep time" that silently excludes the ride would systematically under-promise. The owner-side picker is therefore labelled in door terms (*"How long until this order reaches the customer?"*) and the customer-side copy says **"Arriving"**, never "ready".
+
+#### 3.1.2 Selected at **accept time**, as part of the accept action
+
+The owner knows the realistic total time only when looking at the actual items + current kitchen load — exactly the moment they tap Accept. Decision: tapping **Accept** opens a small **`AcceptOrderModal`** (mirroring `DeclineModal` mechanics) with preset duration chips; confirming performs the accept UPDATE with the ETA in the same statement. One atomic write, one Realtime event, no second decision point.
+
+Cost: accept goes from one tap to two. Mitigation: a **default chip is preselected (30 min)** so the fast path is *Accept → Confirm* with zero extra thought. A per-restaurant default or "remember last choice" is a v2 nicety (§9).
+
+#### 3.1.3 Presets only — `20 / 30 / 45 / 60` minutes, no free-text
+
+Free-text minutes invite typos (3 instead of 30) that become broken promises on the customer's screen. Four chips cover the realistic Gudha Gorji delivery range; the DB CHECK (`BETWEEN 10 AND 120`, §3.2) deliberately stays looser than the UI so adding a chip later (15? 90?) is frontend-only.
+
+#### 3.1.4 Storage — `eta_minutes` (the choice) + `accepted_at` (server-stamped anchor)
+
+```
+orders.eta_minutes  integer      — what the owner chose; snapshot, immutable once set
+orders.accepted_at  timestamptz  — when pending → accepted committed; trigger-stamped
+```
+
+Promise time is **derived**: `accepted_at + eta_minutes`. Why not store a `promised_at` timestamp directly? Because the client would have to compute it (`supabase-js` can't send `now() + interval` through `.update()`), making the promise hostage to the owner device's clock. A trigger stamps `accepted_at = now()` server-side (§3.2), the owner's write carries only the small integer, and both raw facts stay queryable for v2 analytics (*promised vs actual delivery time per restaurant* — the future report that justifies keeping `eta_minutes` rather than only a timestamp).
+
+`updated_at` is **not** a usable anchor — it moves on every subsequent status progression.
+
+#### 3.1.5 Enforcement at the transition, not via a table CHECK
+
+A table-level `CHECK (status requires eta_minutes)` would break existing pre-feature rows (old accepted/completed orders have `NULL`) and — even as `NOT VALID` — would trip on *status progressions of orders accepted before the deploy*, because Postgres re-checks NOT-VALID constraints on every UPDATE. Instead, the requirement lives **in the accept-stamping trigger** (§3.2): `pending → accepted` with `eta_minutes IS NULL` raises. Pre-feature in-flight orders progress untouched (they never re-enter `pending`), and new accepts can't skip the ETA even if a stale client tries.
+
+The same trigger makes `eta_minutes` and `accepted_at` immutable once set — the snapshot rule this codebase already applies to `unit_price` and `discount_amount`. "Owner extends the ETA when running late" is a real future feature, deferred deliberately (§9) — it needs its own customer-facing "ETA updated" treatment to not feel like gaslighting.
+
+#### 3.1.6 Customer display — a window, not a point; never a negative countdown
+
+A single minute ("arriving in 34 min") reads as precision nobody can deliver. The customer page shows:
+
+- **Window:** `eta_minutes` to `eta_minutes + 10` → *"Arriving in 30–40 min"* — the fixed +10 buffer is display-only (under-promise lives in the UI layer; the DB stores the owner's actual choice).
+- **Anchor time:** *"by ~7:45 PM"* using the **window end** (`accepted_at + eta + 10 min`), formatted IST like every other timestamp.
+- **Overdue:** once `now()` passes the window end and the order isn't `completed`, the banner swaps to *"Taking a little longer than expected — your food is still on the way."* Never `-5 min`. No auto-escalation in v1.
+
+Shown for `accepted`, `preparing`, and `out_for_delivery`. Hidden for terminal states and for pre-feature orders (`eta_minutes IS NULL` → render nothing, exactly today's behaviour). A 60 s `setInterval` tick re-renders the banner across the on-track → overdue boundary — same lightweight-tick pattern as `DiscountConfigContext`.
+
+The pure math + state goes in **`src/lib/eta.ts`** (`computeEtaWindow(acceptedAt, etaMinutes, nowMs)`) so it's unit-testable — same extraction rationale as `geo.ts` and `pricing.ts`.
+
+#### 3.1.7 Owner accountability — the promise shows on the active card too
+
+`ActiveOrderCard` gets one line: *"Promised by 7:45 PM"*, flipping to an overdue style after the window ends. The owner made the promise; the dashboard should keep it in view. (This also means the existing `ACTIVE_ORDER_SELECT` and `ActiveOrder` type grow the two new fields.)
+
+#### 3.1.8 What needs **no** change
+
+- **Realtime** — `orders` is already in the publication (006); new columns ride along on UPDATE payloads, and `OrderStatus.tsx` already spreads `payload.new`, so a customer staring at the pending screen sees the ETA banner appear the moment the owner confirms. Zero wiring.
+- **RLS** — owners already hold the UPDATE policy used for accept; customers/owners already SELECT these rows. The actor-gating in §2.1.7 doesn't conflict (cancel touches only `status`).
+- **`place_order`, pricing, SMS backstop, expiry cron** — untouched.
+
+### 3.2 Migration — `014_order_eta.sql`
+
+```sql
+-- ============================================================
+-- 014_order_eta.sql
+-- Owner-selected delivery ETA, chosen at accept time.
+--   (1) orders.eta_minutes + orders.accepted_at
+--   (2) stamp_order_accept trigger: requires eta on
+--       pending → accepted, stamps accepted_at server-side,
+--       makes both columns immutable once set
+-- Promise time is derived (accepted_at + eta_minutes); the +10 min
+-- display buffer is frontend-only. See
+-- src/docs/customer_cancellation_and_eta_plan.md.
+-- ============================================================
+
+-- ── 1. Columns ────────────────────────────────────────────────
+-- eta_minutes: owner's choice, snapshot semantics (like
+-- discount_amount / unit_price). CHECK range is wider than the
+-- UI's 20/30/45/60 chips on purpose — adding a chip later is
+-- frontend-only. NULL = pre-feature order or not yet accepted.
+ALTER TABLE public.orders
+  ADD COLUMN eta_minutes integer
+    CHECK (eta_minutes IS NULL OR eta_minutes BETWEEN 10 AND 120),
+  ADD COLUMN accepted_at timestamptz;
+
+COMMENT ON COLUMN public.orders.eta_minutes IS
+  'Owner-promised minutes from acceptance to delivery at the door. '
+  'Set once at accept (required by stamp_order_accept), immutable. '
+  'NULL on pre-feature and never-accepted orders.';
+COMMENT ON COLUMN public.orders.accepted_at IS
+  'Server-stamped at the pending → accepted transition. Anchor for '
+  'the customer-facing arrival window (accepted_at + eta_minutes).';
+
+-- ── 2. Accept-stamping trigger ────────────────────────────────
+-- Enforcement lives HERE, not in a table CHECK: a CHECK (even
+-- NOT VALID) is re-evaluated on every UPDATE, so it would block
+-- status progressions of orders accepted before this deploy
+-- (which legitimately have NULL eta). The trigger fires only on
+-- the transition itself, so in-flight pre-feature orders progress
+-- untouched while every NEW accept must carry an ETA.
+
+CREATE OR REPLACE FUNCTION public.stamp_order_accept()
+RETURNS trigger AS $$
+BEGIN
+  IF OLD.status = 'pending' AND NEW.status = 'accepted' THEN
+    IF NEW.eta_minutes IS NULL THEN
+      RAISE EXCEPTION 'ETA_REQUIRED: eta_minutes must be set when accepting an order';
+    END IF;
+    NEW.accepted_at := now();
+    RETURN NEW;
+  END IF;
+
+  -- Snapshot rule: once set, neither field moves (same contract
+  -- as unit_price / discount_amount). Silently restore rather than
+  -- raise so unrelated UPDATEs that echo stale values stay safe.
+  IF OLD.eta_minutes IS NOT NULL THEN
+    NEW.eta_minutes := OLD.eta_minutes;
+  END IF;
+  IF OLD.accepted_at IS NOT NULL THEN
+    NEW.accepted_at := OLD.accepted_at;
+  END IF;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER stamp_order_accept
+  BEFORE UPDATE ON public.orders
+  FOR EACH ROW EXECUTE FUNCTION public.stamp_order_accept();
+```
+
+After applying: regenerate `src/types/database.ts` (or hand-extend the placeholder) and add `eta_minutes: number | null` + `accepted_at: string | null` to `Order` in `src/types/models.ts`.
+
+### 3.3 Frontend — owner dashboard
+
+- **`AcceptOrderModal.tsx`** (new, `src/pages/dashboard/`) — mirrors `DeclineModal` mechanics one-for-one (autofocus, ESC, backdrop click, body scroll lock, focus restoration, internal error banner). Content: title *"How long until this order reaches the customer?"*, four radio-style chips (`20 / 30 / 45 / 60 min`) with **30 preselected**, primary button *"Accept order"*, ghost button *"Go back"*. Driven by `acceptingId` state in `OwnerDashboard` exactly the way `decliningId` drives `DeclineModal`.
+- **`OwnerDashboard.tsx`** — `handleAccept(orderId)` becomes `setAcceptingId(orderId)` (opens the modal); the actual mutation moves into `handleAcceptConfirm(etaMinutes: number)`:
+  ```ts
+  .update({ status: "accepted", eta_minutes: etaMinutes })
+  .eq("id", orderId).eq("status", "pending")
+  .select("id, status, eta_minutes, accepted_at")
+  ```
+  Everything downstream is the existing pattern: 0 rows → lost-race toast + refetch; success → optimistic move to Active carrying `eta_minutes` + the returned `accepted_at`. (Note the `.select()` now returns the trigger-stamped `accepted_at` — use it rather than `Date.now()` so the card and the customer page agree.)
+- **`utils.ts` / `types.ts`** — `ACTIVE_ORDER_SELECT` gains `eta_minutes, accepted_at`; `ActiveOrder` gains both fields. `PENDING_ORDER_SELECT` unchanged (pending orders have no ETA yet).
+- **`ActiveOrderCard.tsx`** — one `acard__promise` line: *"Promised by {formatIstTime(windowEnd)}"*, with an `is-overdue` modifier class past the window. Reuses `computeEtaWindow` from `src/lib/eta.ts` and the dashboard's existing per-second/minute tick economy (a 60 s tick at the section level is enough; do **not** join the 1 s pending-countdown ticker).
+
+### 3.4 Frontend — customer side
+
+- **`src/lib/eta.ts`** (new) —
+  ```ts
+  interface EtaWindow {
+    windowStartMin: number;   // eta_minutes
+    windowEndMin: number;     // eta_minutes + ETA_BUFFER_MIN (10)
+    promisedBy: Date;         // accepted_at + windowEndMin
+    state: "on-track" | "overdue";
+  }
+  function computeEtaWindow(acceptedAtIso: string, etaMinutes: number, nowMs: number): EtaWindow
+  ```
+  Pure, no Supabase, fully unit-tested (§6).
+- **`OrderStatus.tsx`** — fetch already uses `select("*")` so the new columns arrive for free. When `status ∈ {accepted, preparing, out_for_delivery}` and `eta_minutes != null`:
+  - on-track: an ETA banner under the status card — **"Arriving in 30–40 min · by ~7:45 PM"**;
+  - overdue: *"Taking a little longer than expected — your food is still on the way."*;
+  - 60 s tick to cross the boundary without a refresh; Realtime UPDATE delivers the initial appearance live.
+  - `eta_minutes == null` (pre-feature / not yet accepted) → no banner, today's rendering exactly.
 
 ---
 
-## 8. Testing (v1 scope: pure logic only)
+## 4. Cross-Feature Notes
 
-- `cardImages.test.ts` — `getCardImages`: empty array + null `image_url` → `[]`; empty array + legacy `image_url` → `[that]`; non-empty array wins over `image_url`; >5 entries truncated to 5 (defence in depth above the DB CHECK).
-- Timer/observer/visibility behaviour is **not** unit-tested (no mocked Supabase / no mocked browser-API rule of thumb in v1) — covered by the manual checklist in §7 Step 5.
-
----
-
-## 9. Edge Cases
-
-| Case | Behaviour |
-|---|---|
-| `image_urls = '{}'`, `image_url` set | Single static image (today's behaviour) — via fallback in `getCardImages` |
-| Both empty | Gradient placeholder, no timer |
-| One URL in the array 404s | That slide shows the browser broken-image state for its 3.5 s; the cycle continues. Optional hardening (v2): `onError` removes the failed slide from rotation |
-| Order placed/accepted etc. | Irrelevant — this feature never touches orders |
-| Dashboard edit sets >5 array entries | Rejected by the DB CHECK (`cardinality <= 5`) |
-| Realtime | Not subscribed — card images update on next page load. Deliberate: image changes are rare, admin-driven, and not worth a channel |
+- **The accept modal vs the cancel button.** The owner can be inside `AcceptOrderModal` choosing a chip while the customer cancels. The confirm's conditional UPDATE matches 0 rows → the existing lost-race toast fires and the modal closes. No new handling — this is just §2.1.6 with a modal in front of it.
+- **`cancelled` orders never carry an ETA** (`eta_minutes` only gets set on the accept path, and cancel is pending-only). No display interaction exists.
+- **Stale clients during rollout.** The PWA's `skipWaiting`/`clientsClaim` config means one reload picks up the new bundle. Until then: an old *customer* client simply lacks the cancel button and ETA banner (additive, harmless); an old *owner* client ignores a `cancelled` Realtime payload, leaving a ghost pending card whose Accept/Decline then hits the 0-row race path — degraded but safe. An old owner client accepting **without** `eta_minutes` is blocked by the trigger (`ETA_REQUIRED`), surfacing as the generic *"Couldn't accept"* toast — acceptable for the minutes-long window, and the reason migration 014 should be applied together with (not days before) the frontend deploy.
 
 ---
 
-## 10. v2 Deferrals (log in `v2_deferred_issues.md` when shipped)
+## 5. File-Touch Summary
 
-- **Owner self-service photo upload** — "Restaurant photos" section in `/dashboard`, reusing the `menu-images` compression + `SECURITY DEFINER` RLS pattern (§2.2).
-- **Swipe gestures / tappable dots** — manual slide control needs a tap-target model that coexists with the card `<Link>` (§2.1, §5.2).
-- **`RestaurantMenu` header uses `image_urls[1]`** (§5.3).
-- **`onError` slide pruning** for dead URLs (§9).
-- **Per-image metadata** (captions, ordering UI) — would justify the `restaurant_images` table this plan rejected (§2.3).
+| Area | File | Change |
+|---|---|---|
+| DB | `supabase/migrations/012_order_status_cancelled.sql` | new — enum value only |
+| DB | `supabase/migrations/013_customer_cancellation.sql` | new — transition trigger v2 + `cancel_order` RPC |
+| DB | `supabase/migrations/014_order_eta.sql` | new — `eta_minutes`, `accepted_at`, `stamp_order_accept` trigger |
+| Types | `src/types/database.ts` | regen (`'cancelled'` enum value) |
+| Types | `src/types/models.ts` | `Order` + `eta_minutes`, `accepted_at` |
+| Lib | `src/lib/eta.ts` (+ `eta.test.ts`) | new — `computeEtaWindow` |
+| Customer | `src/pages/orders/OrderStatus.tsx` (+ `.css`) | cancel button + modal wiring, `cancelled` status copy, ETA banner, 60 s tick |
+| Customer | `src/pages/orders/CancelOrderModal.tsx` (+ `.css`) | new — mirrors `ConfirmOrderModal` patterns, default focus "Keep my order" |
+| Customer | `src/pages/orders/OrderHistory.tsx` (+ `.css`) | neutral `cancelled` badge |
+| Customer | `src/pages/checkout/ConfirmOrderModal.tsx` | copy: "you can still cancel before the restaurant accepts" |
+| Owner | `src/pages/dashboard/AcceptOrderModal.tsx` (+ `.css`) | new — ETA chips, mirrors `DeclineModal` |
+| Owner | `src/pages/dashboard/OwnerDashboard.tsx` | accept flow via modal + `eta_minutes`; Realtime `cancelled` branch + toast |
+| Owner | `src/pages/dashboard/ActiveOrderCard.tsx` (+ `.css`) | "Promised by …" line + overdue style |
+| Owner | `src/pages/dashboard/utils.ts` | `HISTORY_STATUSES` + `historyStatusLabel` + `ACTIVE_ORDER_SELECT` |
+| Owner | `src/pages/dashboard/types.ts` | `ActiveOrder` + `eta_minutes`, `accepted_at` |
+| Tests | `src/pages/dashboard/utils.test.ts` | `historyStatusLabel('cancelled')` |
+| Docs | `CLAUDE.md`, `GEMINI.md` | see §7 |
+
+---
+
+## 6. Testing
+
+Stays inside the v1 testing philosophy (high-risk pure logic only, no mocked Supabase):
+
+- **`src/lib/eta.test.ts`** — `computeEtaWindow`: window math (30 → 30–40), `promisedBy` derivation, on-track/overdue exactly at the boundary minute, and a pre-feature guard isn't needed (callers gate on `eta_minutes != null`).
+- **`src/pages/dashboard/utils.test.ts`** — `historyStatusLabel("cancelled")` → `{ label: "Cancelled", variant: "neutral" }`.
+- **DB behaviour** (trigger actor-gating, RPC races, ETA_REQUIRED, immutability) falls under the deferred real-Supabase integration suite (`phase4_stabilisation_plan.md` §3.2) — verified manually via the checklist below for now.
+
+### Manual verification checklist
+
+1. Customer places order → `/orders/:id` shows the Cancel button; cancel → status flips to *"You cancelled this order."*; owner dashboard pending card disappears with the *"cancelled by the customer"* toast; row appears in Today's History as **Cancelled** (neutral badge); no SMS arrives a minute later.
+2. Two windows: owner accepts a split-second before the customer confirms cancel → customer sees *"already accepted"*, page shows accepted + ETA. Repeat inverted: cancel first → owner gets the lost-race toast.
+3. Owner accepts: modal shows chips, 30 preselected; confirm → customer page (already open on pending) live-updates to the ETA banner with the right IST time; active card shows *"Promised by …"*.
+4. SQL editor as owner session: `UPDATE orders SET status='cancelled' …` on a pending order → raises *"Only the customer can cancel an order"*. `UPDATE … SET status='accepted'` without `eta_minutes` → raises `ETA_REQUIRED`. `UPDATE … SET eta_minutes = 99` on an accepted order → value silently restored.
+5. Pre-feature in-flight order (accepted before 014): progress it through to completed → no trigger errors, no ETA banner on the customer page.
+6. Let the window lapse (small test ETA or temporary trigger edit) → both customer banner and active card flip to overdue copy; no negative numbers anywhere.
+7. `npm test` green; `npm run lint` clean; `npm run build` succeeds.
+
+---
+
+## 7. Documentation Housekeeping (part of the PRs, not optional)
+
+- **`CLAUDE.md`** — multiple load-bearing statements become false and must be updated: the status-flow line (*"No cancellation"* → add `pending → cancelled (customer)`); the `/checkout` route note (*"There's no order cancellation in v1"*); the v2-deferred list (remove *order cancellation*); the Database critical-rules section (add `cancel_order` RPC + `eta_minutes`/`accepted_at` snapshot rules + `stamp_order_accept`); the `/orders/:id` route row (ETA banner + cancel). **`GEMINI.md`** mirrors all of it.
+- **`src/docs/v2_deferred_issues.md`** — add the new deferrals from §9.
+- Migration headers cross-reference this document (already in the SQL above).
+
+---
+
+## 8. Rollout
+
+- Two PRs, independent, either order: `feat/customer-cancel-order` (012 + 013 + customer/owner cancellation UI) and `feat/order-eta` (014 + accept modal + banners). If ETA merges first, renumber its migration to 012 and shift cancellation to 013/014 — numbering follows merge order.
+- The Supabase↔GitHub integration applies migrations on each PR's preview branch; remember (per `cloud.md` memory) that **secrets and pg_cron do not carry over to preview branches** — irrelevant here (no new secrets/cron), but the SMS-backstop part of checklist item 1 only proves out against production-like env.
+- Apply each migration set and its frontend deploy **together** (§4 stale-client note), outside peak hours (12–2 PM, 7–9:30 PM IST).
+
+---
+
+## 9. Recommendations Adopted & v2 Deferrals
+
+Adopted in this design (beyond the literal request):
+
+1. **Pending-only cancellation with no reason field** — the rule is free for restaurants and trivially explainable to customers.
+2. **RPC instead of a customer UPDATE policy** — a direct RLS path would hand customers accept/decline forgery (§2.1.5).
+3. **Actor-gated transition trigger** — owners can't disguise a decline as a customer cancellation (§2.1.7).
+4. **ETA means door-arrival, not prep** — and is shown as a buffered **range** (under-promise, over-deliver) rather than a false-precision single minute.
+5. **Server-stamped `accepted_at`** — the promise anchor never depends on a phone's clock.
+6. **Preset chips with a preselected default** — keeps owner friction at effectively one extra tap.
+7. **Promise visible on the owner's active card** — accountability for the number they chose.
+
+Deferred to v2 (log in `v2_deferred_issues.md`):
+
+- **"Running late" ETA extension** — owner bumps the promise once, customer sees an explicit *"ETA updated"* state. Needs the immutability rule relaxed deliberately, not accidentally.
+- **Post-acceptance cancellation grace window** (e.g. 60 s after accept) — reopens the food-waste question; only worth it with data showing demand.
+- **Cancellation abuse controls** — place/cancel cycles still chime the owner each time; add rate limiting or a daily cancellation cap if analytics (`SELECT count(*) FROM orders WHERE status='cancelled' GROUP BY customer_id`) show a problem.
+- **Customer SMS on accept** ("your order arrives by 7:45 PM") — new DLT template + per-order SMS cost; the in-app Realtime banner covers the open-tab case free.
+- **Per-restaurant default ETA chip / remember-last-choice** — micro-optimisation of the accept modal.
+- **Promised-vs-actual delivery analytics** — `accepted_at + eta_minutes` vs `updated_at` of the `completed` transition; both columns were kept raw precisely to enable this.
