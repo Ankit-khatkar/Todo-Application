@@ -1,394 +1,564 @@
-# Customer Search — Feature Design & Implementation Doc
+# Delivery Address Capture — Build Plan
 
-## 1. Context & Goal
+> **Status:** Proposed (not yet implemented)
+> **Author:** Ankit
+> **Goal:** Let a customer drop their delivery address from their **current GPS location** at checkout — reverse-geocoded to editable text, with the **exact pin stored on the order** so the restaurant owner gets a one-tap **navigate link** to the door. Logged-in customers can **save** addresses to a small labelled book (**Home / Office / Other**) and reuse them.
+>
+> **One-line summary:**
+> - **"📍 Use my current location" button** on the checkout address step → one-shot precise GPS fix via a new extracted helper.
+> - **Reverse-geocode** the fix with **Nominatim (OpenStreetMap)** — free, no API key — and show the result in a **confirm modal with an editable text box** (village OSM coverage is coarse, so the text is a *hint* the user corrects; the pin is the source of truth).
+> - **Store `delivery_lat` / `delivery_lng` on the order** so `PendingOrderCard` / `ActiveOrderCard` render a **Google Maps navigate link** to the precise drop-off.
+> - **`delivery_addresses` table** — a per-user labelled address book (one Home, one Office, many Others), saved **opt-in** at checkout, RLS-scoped to the owner customer only.
 
-Customers open `/restaurants` and see a distance-sorted grid of nearby kitchens, but there is
-**no way to search**. To find a specific dish ("biryani", "paneer") a customer must open each
-restaurant's menu one at a time. In a food app people think in terms of *food*, not the names
-of local kitchens they don't know yet — so the most valuable missing capability is: *type what
-you want, and see which nearby kitchen makes it.*
-
-**Goal:** add a search box on `/restaurants` that filters **restaurants** (name/cuisine) **and
-dishes** (name/description) in a single view, **strictly confined to the customer's delivery
-radius**, with a **veg / non-veg** toggle on dish results.
-
-### Scale & multi-city (the constraints that shape the design)
-- Production today: **~15 restaurants, ~300–400 dishes** (the repo's `supabase/seed.sql` 5
-  restaurants / 40 dishes is **local dummy data only**).
-- The business is **expanding to other cities**.
-- **Hard requirement:** restaurants and dishes from **other cities must never appear** in search
-  results, and — because the dish table will grow large across cities — the **dishes table must
-  never be fetched globally** to the browser.
-
-**How the design satisfies this:** search is bounded by the **same 4 km delivery radius**
-(`RADIUS_KM`) the grid already uses. Radius-from-GPS naturally isolates a customer to their own
-locality (a user in City A is never within 4 km of City B). Dishes are fetched **only for the
-restaurants already inside that radius** (`.in('restaurant_id', nearbyIds)`), so other cities'
-dishes are neither shown nor downloaded. Text + veg matching then runs in the browser over that
-small, radius-bounded set.
-
-This remains a **frontend-only** change: no DB migration, no RPC, no new route, no navbar change.
+This feature delivers two items already scoped as v2 in [`location_resilience_plan.md` §8](location_resilience_plan.md) ("Saved address book", "Reverse-geocoded address confirmation") and substantially closes [`v2_deferred_issues.md` §3](v2_deferred_issues.md) (desktop / no-Wi-Fi-database dead-end now has a *preventive* address-capture path, not just the reactive owner-decline net).
 
 ---
 
-## 2. Locked decisions
+## 1. Why This Change
 
-| Decision | Choice | Rationale |
-|---|---|---|
-| Search scope | Restaurants **+** dishes | Highest discovery value |
-| Placement | Inline on `/restaurants` (no new route) | Reuses GPS/radius flow; least infra |
-| Data strategy | **Nearby-scoped fetch + client-side match** | Dishes fetched only for in-radius restaurants; instant matching; no migration |
-| Search radius | **Same 4 km delivery radius** (`RADIUS_KM`) | Only orderable results; auto-excludes other cities |
-| Multi-city isolation | Radius-from-GPS + scoped dish fetch | Other cities never shown **or** fetched (dishes) |
-| Restaurant match fields | `name` + `cuisine_type` | Both customer-meaningful |
-| Dish match fields | `name` + `description` | Ingredient terms work (e.g. "aloo") |
-| Match algorithm | Token-AND substring, case-insensitive | Predictable; "paneer pizza" → "Paneer Makhani Pizza" |
-| Veg filter | **All / Veg / Non-veg** chips on dish results | Only dishes carry `is_veg` |
-| Dish tap | Open restaurant menu (`/restaurants/:id`) | Simplest; no `RestaurantMenu` change |
+### 1.1 The address is typed blind today
 
----
+[`Checkout.tsx`](../pages/checkout/Checkout.tsx) collects the delivery address with a plain `<textarea>` (`Checkout.tsx:238`) validated only by `address.trim().length > 10` (`Checkout.tsx:59`). In a village, a typed address is often unusable for a rider — *"behind the temple"*, *"Sharma ji ka ghar"* — and there is **no coordinate** attached. The owner sees `📍 {order.delivery_address}` as static text in [`PendingOrderCard.tsx:102`](../pages/dashboard/PendingOrderCard.tsx) and [`ActiveOrderCard.tsx:123`](../pages/dashboard/ActiveOrderCard.tsx) with no way to navigate to it.
 
-## 3. Where this lives in the code
+### 1.2 We already have the customer's location — we throw it away
 
-Single host: **`src/pages/restaurants/RestaurantList.tsx`** (+ its CSS). It already owns the
-restaurants fetch, the GPS→cache→radius pipeline, the `visible` list (within-radius,
-distance-sorted), `EmptyState`, and the card markup. **The existing location/grid flow is left
-untouched** — search layers on top of `visible`, so restaurant results inherit radius +
-open/active gating for free, and the dish fetch is keyed off the same `visible` set.
+`/restaurants` already obtains a GPS fix (the coarse-first sequence in [`RestaurantList.tsx`](../pages/restaurants/RestaurantList.tsx)) and even caches it (`localStorage["redlotus_last_location"]`). But that fix dies on the restaurants page; checkout never reuses it. The customer is standing exactly where they want the food delivered, and we ask them to describe it in prose.
 
-New pure module: **`src/lib/search.ts`** (+ `src/lib/search.test.ts`) — match logic only,
-no React, following the repo's "tested pure logic in `src/lib`" convention (`geo.ts`,
-`pricing.ts`, `eta.ts`).
+### 1.3 No address reuse
+
+A returning customer re-types the same address every order. There is no `addresses` table, no saved book, and `public.users` has no address column. [`location_resilience_plan.md` §8](location_resilience_plan.md) explicitly deferred the address book to v2; this plan brings the *minimum useful* version forward because it falls out naturally once we're capturing a structured address anyway.
+
+### 1.4 What this is NOT
+
+This is **not** a re-architecture of the `/restaurants` geolocation flow (that stays as-is — see [`location_resilience_plan.md`](location_resilience_plan.md)). It adds a **second, simpler, explicit** geolocation touchpoint at checkout: a deliberate "use my location" button, one-shot and precise, not a silent background fix.
 
 ---
 
-## 4. Data layer (`RestaurantList.tsx`)
+## 2. Decisions Locked (from requirements review)
 
-### 4.1 What stays the same
-The existing mount effect that fetches restaurants and the geolocation pipeline are **unchanged**.
-`visible` (within-radius, distance-sorted `{ r, distance }[]`) remains the source of truth for the
-grid and for restaurant search results.
+These three forks were confirmed before this plan was written:
 
-> Note: the restaurants fetch is still global (then haversine-filtered client-side). Restaurants
-> are a small table relative to dishes (~1:25), so this is acceptable near-term; geo-scoping it
-> (bounding box) is listed as a future optimisation in §14.
+| # | Decision | Chosen | Consequence |
+|---|---|---|---|
+| 1 | **Saved-address model** | **Labelled book + opt-in save** | New `delivery_addresses` table; user keeps multiple labelled addresses, picks one at checkout, and a new address persists *only* when they tick "Save this address" and choose a label. One-off addresses (ordering for a friend) stay out of the book. |
+| 2 | **Reverse-geocode provider** | **Nominatim (OSM), fully editable** | Free, no API key. Pre-fills the confirm modal; user edits. Coordinates always go to the owner regardless of text quality. Degrades to manual typing if Nominatim is down/rate-limited. OSM attribution required. |
+| 3 | **Owner navigation** | **Store the GPS pin on the order** | `orders` gains nullable `delivery_lat` / `delivery_lng`; `place_order` migration threads them; owner cards render a Google Maps directions link. Typed-only orders fall back to a Maps text search. |
 
-### 4.2 Dishes — fetched **scoped to the in-radius restaurants**, lazily
-```ts
-type DishRow = Pick<MenuItem, "id" | "restaurant_id" | "name" | "description" | "price" | "is_veg">;
+### 2.1 Correction to the original requirements
 
-const [menuItems, setMenuItems] = useState<DishRow[]>([]);
-const [dishesStatus, setDishesStatus] = useState<"idle" | "loading" | "loaded" | "error">("idle");
-const [searchFocused, setSearchFocused] = useState(false); // set true on first input focus
-const fetchedKeyRef = useRef<string>("");                   // visibleIds set we last fetched for
+Requirement #2 referenced *"the existing `useGeolocation.ts` hook"*. **No such hook exists.** Geolocation today is an inline `useEffect` in `RestaurantList.tsx` plus two extracted helpers: [`geo.ts`](../lib/geo.ts) (`haversineKm`, `Coords`) and [`locationCache.ts`](../lib/locationCache.ts). This plan therefore **extracts a small one-shot helper** (`src/lib/geolocation.ts`, §4.3) rather than reusing a hook that isn't there. The `/restaurants` coarse-first/cache/drift machinery is deliberately *not* reused at checkout — that flow optimises for a silent, cache-first background fix; checkout wants a fresh, precise, user-initiated fix.
+
+---
+
+## 3. The Approach
+
+### 3.1 Coordinates are the source of truth; text is an editable annotation
+
+The load-bearing idea. In Gudha Gorji, OSM reverse-geocoding will frequently return only a road or the village name — not a house. That is **fine**, because:
+
+- The **pin** (`delivery_lat/lng`) is what the rider actually navigates to. It is captured from where the customer physically stands when they tap the button.
+- The **text** is a human hint the customer edits ("blue gate next to Hanuman temple") and the owner reads alongside the pin.
+
+So a coarse or empty geocode never blocks the flow — the user just types the landmark themselves and the pin carries the precision. This is why **option 2 (Nominatim) and option 3 (store the pin)** combine well: even when the text is weak, delivery still works.
+
+### 3.2 Explicit, one-shot, precise geolocation
+
+The button calls `getCurrentPositionOnce()` (§4.3) with `enableHighAccuracy: true, timeout: 15_000, maximumAge: 0` — i.e. the `PRECISE_OPTIONS` profile from `RestaurantList.tsx`, *not* the coarse profile. Rationale: this is a deliberate "pin my doorstep" action, so we want the best fix available, and the user is actively waiting (a spinner on the button is acceptable; a silent stale cache hit is not). We do **not** read `locationCache` here — a cached fix from browsing restaurants an hour ago is not necessarily where they want delivery now.
+
+`GeolocationPositionError.code` is mapped to friendly copy reusing the same taxonomy as `RestaurantList` (`denied | timeout | unavailable | unsupported`). The button degrades gracefully: on any error, the user keeps the manual textarea — the button is an **enhancement, never a dependency**.
+
+### 3.3 Reverse geocoding via Nominatim — and its rules
+
+Endpoint (single GET, on button confirm only — never per-keystroke):
+
+```
+https://nominatim.openstreetmap.org/reverse
+  ?format=jsonv2&lat=<lat>&lon=<lng>&zoom=18&addressdetails=1
 ```
 
-Stable key for the current nearby set:
+**Nominatim Usage Policy compliance is mandatory** (the public instance is free but enforced):
+
+1. **≤ 1 request/second.** We only call on an explicit button tap (and guard against double-tap with a `locating` flag), so we are structurally far under this. No autocomplete, no per-keystroke calls — ever.
+2. **Identify the application.** Browsers forbid setting `User-Agent`, but the `Referer` header is sent automatically from `https://redlotusfoods.in`, which satisfies the "identify yourself" requirement for browser apps. We additionally namespace the call behind one wrapper (§4.4) so a contact param can be added if Nominatim ever asks.
+3. **Attribution.** "© OpenStreetMap contributors" **must** be displayed where the result is shown. The confirm modal (§4.5) carries a small attribution line. Non-negotiable for ToS compliance.
+4. **Timeout + abort.** The wrapper uses `AbortController` with an ~8 s timeout. A slow/failed reverse-geocode must never strand the user — it falls back to an empty (manually typed) address with the pin still captured.
+
+**Provider-swap seam.** All Nominatim specifics live in `src/lib/geocoding.ts` (§4.4) behind `reverseGeocode(coords): Promise<ReverseGeocodeResult>`. Swapping to a paid provider (Google/Ola Maps) later is a one-file change — the decision recorded in §2 can be revisited without touching Checkout.
+
+**Service Worker / CSP note.** Workbox `runtimeCaching` ([`vite.config.ts`](../../vite.config.ts)) only matches `fonts.googleapis.com` / `fonts.gstatic.com`; the Nominatim call is not precached or intercepted, and `navigateFallback` only affects navigations (not `fetch`). **No SW change needed.** There is no Content-Security-Policy in `index.html` today — but if one is ever added, `connect-src` must include `https://nominatim.openstreetmap.org`. Recorded here so it isn't a silent breakage later.
+
+### 3.4 Confirm modal — editable, mirrors existing modal mechanics
+
+A new `LocationConfirmModal` (§4.5) modeled exactly on [`ConfirmOrderModal.tsx`](../pages/checkout/ConfirmOrderModal.tsx) / [`DeclineModal`](../pages/dashboard/DeclineModal.tsx): focus capture + restore on unmount, `Escape` to close, backdrop-click to close, `document.body` scroll-lock, internal error banner. It shows:
+
+- The detected address in an **editable `<textarea>`** (pre-filled from Nominatim, possibly empty).
+- An optional **"Save this address"** checkbox + **Home / Office / Other** label chips (only shown to logged-in users; §3.6).
+- **Confirm** (writes address + coords back to Checkout state) and **Cancel** (dismiss, keep prior state).
+- The OSM attribution line.
+
+### 3.5 Order state wiring
+
+Today the address lives in Checkout local state (`useState`), not in `CartContext` — and that is the right scope (the cart is restaurant+items; the address is per-checkout). We keep it there and **add coordinates alongside**:
+
 ```ts
-const visibleIdsKey = useMemo(
-  () => visible.map((v) => v.r.id).sort().join(","),
-  [visible],
+const [address, setAddress] = useState("");
+const [coords, setCoords] = useState<Coords | null>(null);   // ← new
+```
+
+`handlePlaceOrder` ([`Checkout.tsx:71`](../pages/checkout/Checkout.tsx)) passes them to the RPC:
+
+```ts
+const { data, error: rpcErr } = await supabase.rpc("place_order", {
+  p_restaurant_id: cart.restaurant_id,
+  p_delivery_address: address.trim(),
+  p_delivery_lat: coords?.lat ?? null,   // ← new
+  p_delivery_lng: coords?.lng ?? null,   // ← new
+  p_special_instructions: notes.trim() ? notes.trim() : null,
+  p_items: cart.items.map((i) => ({ menu_item_id: i.menu_item_id, quantity: i.quantity })),
+  p_subtotal: pricing.subtotal,
+  p_discount: pricing.discount,
+  p_delivery_fee: pricing.deliveryFee,
+});
+```
+
+`coords` is `null` when the user typed the address manually without using the button — fully supported (owner gets a text-search link).
+
+### 3.6 Saved address book (opt-in)
+
+`delivery_addresses` (§4.1) is a per-user labelled book:
+
+- **`home` and `office`** are singletons per user — saving again **upserts** (overwrites). Enforced by a partial unique index on `(user_id, label)`.
+- **`other`** is unlimited and distinguished by an optional `custom_label` ("Mom's", "Hostel"). Saved by insert; edited by id.
+
+At checkout, logged-in customers see their saved addresses as a radio list above the textarea (default address pre-selected). Picking one fills `address` + `coords` from the row. "Add new address" reveals the blank textarea + the location button. **A new address persists to the book only when the user opts in** (the modal checkbox). Persistence happens **on successful order placement** (see Open Question §9.1) via `upsertDeliveryAddress` in the new data layer (§4.6), so we don't accumulate saved rows for orders the user abandoned.
+
+The book is **never exposed to restaurant owners** — the order carries its own `delivery_address` + `delivery_lat/lng` snapshot (the same snapshot doctrine as `customer_name`/`customer_phone` in migration 004 and `order_items.unit_price`). Editing or deleting a saved address later must not mutate historical orders.
+
+### 3.7 Owner navigate link
+
+A new `mapsLink()` helper (§4.7) builds the URL:
+
+- **Coords present:** `https://www.google.com/maps/dir/?api=1&destination=<lat>,<lng>` — opens turn-by-turn directions to the exact pin in one tap (best for a rider).
+- **Coords absent (typed-only / pre-015 orders):** `https://www.google.com/maps/search/?api=1&query=<encoded address text>` — a best-effort text search.
+
+`PendingOrderCard` and `ActiveOrderCard` render the existing `📍 {delivery_address}` line plus a **"Navigate ▸"** anchor (`target="_blank"`, `rel="noopener noreferrer"`). Google Maps is the target because it is near-universal on Indian owner phones; swapping to an OSM/`geo:` link is a one-line change in the helper (see Open Question §9.6).
+
+---
+
+## 4. Implementation
+
+> Line numbers are fragile — symbols are referenced by name. New files are marked **NEW**.
+
+### 4.1 **NEW** migration `supabase/migrations/015_delivery_addresses.sql`
+
+Three changes in one migration (run after `014_order_eta.sql`):
+
+**(a) `orders` gains the pin.** Nullable — typed-only and pre-015 orders are `NULL`.
+
+```sql
+ALTER TABLE public.orders
+  ADD COLUMN delivery_lat float8
+    CHECK (delivery_lat IS NULL OR delivery_lat BETWEEN -90 AND 90),
+  ADD COLUMN delivery_lng float8
+    CHECK (delivery_lng IS NULL OR delivery_lng BETWEEN -180 AND 180);
+```
+
+We deliberately do **not** constrain to a Gudha Gorji bounding box — the override path and edge geographies must not be rejected at the DB layer (parallels the `RADIUS_KM` check living in the app, not the schema). The owner-visibility of these columns needs **no RLS change**: `orders_owner_select` ([`002_security.sql:165`](../../supabase/migrations/002_security.sql)) already grants the owning restaurant SELECT on the whole row.
+
+**(b) `delivery_addresses` table + RLS.**
+
+```sql
+CREATE TABLE public.delivery_addresses (
+  id           uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id      uuid        NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  label        text        NOT NULL CHECK (label IN ('home','office','other')),
+  custom_label text,                       -- names an 'other' address; NULL for home/office
+  address_text text        NOT NULL CHECK (length(btrim(address_text)) >= 10),
+  lat          float8      CHECK (lat IS NULL OR lat BETWEEN -90 AND 90),
+  lng          float8      CHECK (lng IS NULL OR lng BETWEEN -180 AND 180),
+  is_default   boolean     NOT NULL DEFAULT false,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  updated_at   timestamptz NOT NULL DEFAULT now()
 );
+
+-- One Home and one Office per user (upsert target); 'other' may repeat.
+CREATE UNIQUE INDEX delivery_addresses_singleton_label
+  ON public.delivery_addresses (user_id, label)
+  WHERE label IN ('home','office');
+
+-- At most one default per user.
+CREATE UNIQUE INDEX delivery_addresses_one_default
+  ON public.delivery_addresses (user_id)
+  WHERE is_default;
+
+CREATE INDEX idx_delivery_addresses_user ON public.delivery_addresses (user_id);
+
+-- Reuse set_updated_at() from migration 003 (same pattern as discount_config in 006).
+CREATE TRIGGER set_delivery_addresses_updated_at
+  BEFORE UPDATE ON public.delivery_addresses
+  FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+ALTER TABLE public.delivery_addresses ENABLE ROW LEVEL SECURITY;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.delivery_addresses TO authenticated;
+
+-- Customer manages ONLY their own rows. No owner access (orders carry the snapshot).
+CREATE POLICY delivery_addresses_own_all ON public.delivery_addresses
+  FOR ALL USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());
+
+CREATE POLICY delivery_addresses_admin_all ON public.delivery_addresses
+  FOR ALL USING (get_user_role() = 'admin') WITH CHECK (get_user_role() = 'admin');
 ```
 
-Fetch effect — runs the first time the user engages search (focus **or** typing) and refetches
-only if the nearby set changed (e.g. the customer moved and a restaurant entered/left the radius):
-```ts
-useEffect(() => {
-  const engaged = searchFocused || normalize(query) !== "";
-  if (!engaged || visibleIdsKey === "") return;
-  if (visibleIdsKey === fetchedKeyRef.current) return; // already have this nearby set
+No Realtime publication membership needed — the book is read on demand at checkout, not subscribed.
 
-  const ids = visibleIdsKey.split(",");
-  let cancelled = false;
-  setDishesStatus("loading");
-  (async () => {
-    const { data, error: mErr } = await supabase
-      .from("menu_items")
-      .select("id, restaurant_id, name, description, price, is_veg")
-      .in("restaurant_id", ids);
-    if (cancelled) return;
-    if (mErr) {
-      setDishesStatus("error");           // NON-FATAL: restaurants stay searchable
+**(c) `place_order` v3 — thread the pin.** Same DROP-then-recreate doctrine as migration 006 (§5 there): drop the 7-arg signature so it can't be called, recreate with two appended params **defaulting `NULL`**. Because the new params have defaults and the old signature is dropped, a stale PWA client that still sends the 7 keys resolves to this one function (defaults fill the pin) — **no hard break during rollout**, while all the existing pricing/`PRICING_MISMATCH` checks still run.
+
+```sql
+DROP FUNCTION IF EXISTS public.place_order(uuid, text, text, jsonb, numeric, numeric, numeric);
+
+CREATE OR REPLACE FUNCTION public.place_order(
+  p_restaurant_id        uuid,
+  p_delivery_address     text,
+  p_special_instructions text,
+  p_items                jsonb,
+  p_subtotal             numeric,
+  p_discount             numeric,
+  p_delivery_fee         numeric,
+  p_delivery_lat         float8 DEFAULT NULL,   -- ← new, optional
+  p_delivery_lng         float8 DEFAULT NULL    -- ← new, optional
+) RETURNS uuid AS $$
+  -- ... identical body to 006 (contact read, server subtotal/discount/delivery
+  --     recompute, ±₹0.01 mismatch checks) ...
+  -- the only change is the orders INSERT column list + VALUES:
+  --   INSERT INTO public.orders (
+  --     customer_id, restaurant_id, customer_name, customer_phone,
+  --     total_amount, discount_amount, delivery_fee,
+  --     delivery_address, delivery_lat, delivery_lng, special_instructions)
+  --   VALUES (auth.uid(), p_restaurant_id, v_full_name, v_phone,
+  --     v_server_total, v_server_discount, v_server_delivery_fee,
+  --     p_delivery_address, p_delivery_lat, p_delivery_lng, p_special_instructions)
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+```
+
+> The coordinates are **unvalidated client metadata** (unlike pricing). That is acceptable: they only ever feed a maps link the owner opens, the CHECK constraints bound them to the globe, and a customer spoofing their own delivery pin only hurts their own delivery. No server recompute is possible (we can't independently know where they are).
+
+After applying on the Supabase preview branch, **regenerate types**: `npx supabase gen types typescript --local > src/types/database.ts`.
+
+### 4.2 `src/types/models.ts` + `src/types/database.ts`
+
+- `database.ts` is regenerated (it now contains the real `orders` Row/Insert/Update and the `place_order` Args — verified). The regen picks up `delivery_lat/lng` and the new arg defaults, and adds the `delivery_addresses` table types.
+- `models.ts` is the hand-maintained mirror: add `delivery_lat: number | null` and `delivery_lng: number | null` to the `Order` interface, and add a new `DeliveryAddress` interface:
+
+```ts
+export interface DeliveryAddress {
+  id: string;
+  user_id: string;
+  label: "home" | "office" | "other";
+  custom_label: string | null;
+  address_text: string;
+  lat: number | null;
+  lng: number | null;
+  is_default: boolean;
+  created_at: string;
+  updated_at: string;
+}
+```
+
+(Per `models.ts` convention — `UserProfile` stays owned by `AuthContext`; everything else is fine here.)
+
+### 4.3 **NEW** `src/lib/geolocation.ts` (+ `geolocation.test.ts`)
+
+A promisified one-shot wrapper + error taxonomy, extracted so checkout (and any future caller) doesn't duplicate `RestaurantList`'s callback soup.
+
+```ts
+import type { Coords } from "./geo";
+
+export type GeoErrorKind = "unsupported" | "denied" | "unavailable" | "timeout";
+
+export const PRECISE_OPTIONS: PositionOptions = {
+  enableHighAccuracy: true,
+  timeout: 15_000,
+  maximumAge: 0,
+};
+
+export function mapGeoErrorKind(code: number): GeoErrorKind {
+  if (code === 1) return "denied";
+  if (code === 3) return "timeout";
+  return "unavailable";
+}
+
+/** One-shot precise fix. Rejects with a GeoErrorKind-tagged error. */
+export function getCurrentPositionOnce(
+  options: PositionOptions = PRECISE_OPTIONS,
+): Promise<Coords & { accuracy: number }> {
+  return new Promise((resolve, reject) => {
+    if (typeof navigator === "undefined" || !("geolocation" in navigator)) {
+      reject({ kind: "unsupported" as GeoErrorKind });
       return;
     }
-    setMenuItems((data ?? []) as DishRow[]);
-    fetchedKeyRef.current = visibleIdsKey;
-    setDishesStatus("loaded");
-  })();
-  return () => { cancelled = true; };
-}, [searchFocused, query, visibleIdsKey]);
+    navigator.geolocation.getCurrentPosition(
+      (pos) =>
+        resolve({
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude,
+          accuracy: pos.coords.accuracy,
+        }),
+      (err) => reject({ kind: mapGeoErrorKind(err.code) as GeoErrorKind }),
+      options,
+    );
+  });
+}
 ```
 
-Rules & guarantees:
-- **Radius/city isolation:** the request carries `restaurant_id=in.(<nearby ids>)`, so only dishes
-  from restaurants already inside the 4 km radius are fetched. Other cities' dishes never leave the
-  DB. (RLS `menu_items_customer_select` additionally enforces `is_available` + visible restaurants.)
-- **Lazy:** browse-only sessions never fetch dishes. Prefetch on **focus** means dishes are
-  usually ready before the first keystroke completes.
-- **Bounded payload:** the result set is whatever is within 4 km (tens of restaurants → a few
-  hundred dish rows worst case), regardless of total catalogue size or number of cities.
-- **Non-fatal:** on error, dishes stay empty and `dishesStatus="error"`; restaurant search + grid
-  keep working.
-- `price` may arrive as a string (`numeric`) — coerce with `Number(...)` at format time.
-  `is_veg` is `boolean NOT NULL` — no null handling.
+An optional thin `useGeolocation()` hook (`{ request, status, coords, error }`) can wrap this for ergonomics, but the promise is the testable core. **Tests** (`geolocation.test.ts`): `mapGeoErrorKind` for codes 1/2/3; `getCurrentPositionOnce` resolves with mocked `navigator.geolocation.getCurrentPosition` success; rejects with `unsupported` when geolocation is absent; rejects with the mapped kind on error callback.
 
----
+### 4.4 **NEW** `src/lib/geocoding.ts` (+ `geocoding.test.ts`)
 
-## 5. Search logic module — `src/lib/search.ts`
-
-Pure functions, fully unit-tested.
+Nominatim behind a stable, swappable interface.
 
 ```ts
-/** lowercase, trim, collapse internal whitespace; null/undefined → "" */
-export function normalize(s: string | null | undefined): string {
-  return (s ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+import type { Coords } from "./geo";
+
+export interface ReverseGeocodeResult {
+  /** Human-readable address. May be coarse (road/village) in rural India. */
+  displayName: string;
 }
 
-/**
- * True iff EVERY whitespace-separated token of `query` is a substring of `haystack`.
- * Empty/whitespace query → false (callers treat empty query as "not searching").
- */
-export function matchesAllTokens(haystack: string, query: string): boolean {
-  const h = normalize(haystack);
-  const tokens = normalize(query).split(" ").filter(Boolean);
-  if (tokens.length === 0) return false;
-  return tokens.every((t) => h.includes(t));
-}
+const ENDPOINT = "https://nominatim.openstreetmap.org/reverse";
+const TIMEOUT_MS = 8_000;
 
-export function restaurantMatches(
-  r: { name: string; cuisine_type: string | null },
-  query: string,
-): boolean {
-  return matchesAllTokens(`${r.name} ${r.cuisine_type ?? ""}`, query);
-}
-
-export function dishMatches(
-  d: { name: string; description: string | null },
-  query: string,
-): boolean {
-  return matchesAllTokens(`${d.name} ${d.description ?? ""}`, query);
+/** Reverse-geocode a fix to text. Returns null on any failure — the caller
+ *  falls back to manual entry; the pin is captured regardless. */
+export async function reverseGeocode(coords: Coords): Promise<ReverseGeocodeResult | null> {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), TIMEOUT_MS);
+  try {
+    const url =
+      `${ENDPOINT}?format=jsonv2&lat=${coords.lat}&lon=${coords.lng}` +
+      `&zoom=18&addressdetails=1`;
+    const res = await fetch(url, {
+      signal: ac.signal,
+      headers: { Accept: "application/json" },
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { display_name?: string };
+    if (!data.display_name) return null;
+    return { displayName: data.display_name };
+  } catch {
+    return null; // abort / network / parse — non-fatal
+  } finally {
+    clearTimeout(t);
+  }
 }
 ```
 
-**Semantics & examples**
-- Case-insensitive: `"PANEER"` matches "Paneer Tikka".
-- Token-AND, non-contiguous: `"veg rice"` matches "Veg Fried Rice".
-- Single token = plain substring: `"bir"` matches "Chicken Biryani".
-- Description matching: `"chinese"` matches "Hot & Sour Soup" (desc "…Indo-Chinese soup…").
-- Out of scope: diacritic folding, fuzzy/typo tolerance, ranking.
+**Tests** (mock `global.fetch`): success → `{ displayName }`; `res.ok === false` → `null`; thrown/aborted fetch → `null`; missing `display_name` → `null`. Pure, no component render — fits the existing pure-logic suite.
 
----
+### 4.5 **NEW** `src/pages/checkout/LocationConfirmModal.tsx` (+ `.css`)
 
-## 6. Component logic (`RestaurantList.tsx`)
+Mirror `ConfirmOrderModal`'s mechanics (the three `useEffect`s: focus restore, `Escape`, scroll-lock; backdrop stop-propagation). Props sketch:
 
-### 6.1 Derived values (`useMemo`)
 ```ts
-const searching = useMemo(() => normalize(query) !== "", [query]);
-const canSearch = !error && !locationError && visible.length > 0;
-
-// id → { name, distance } for dish-row enrichment + a defensive radius guard.
-const restaurantById = useMemo(
-  () => new Map(visible.map((v) => [v.r.id, { name: v.r.name, distance: v.distance }])),
-  [visible],
-);
-
-const restaurantResults = useMemo(
-  () => (searching ? visible.filter(({ r }) => restaurantMatches(r, query)) : []),
-  [searching, visible, query],
-);
-
-// Dishes are already nearby-scoped by the fetch; the .has() guard drops any row whose
-// restaurant just left the radius before a refetch, and supplies name/distance.
-const dishCandidates = useMemo(() => {
-  if (!searching) return [];
-  return menuItems
-    .filter((d) => restaurantById.has(d.restaurant_id) && dishMatches(d, query))
-    .map((d) => {
-      const meta = restaurantById.get(d.restaurant_id)!;
-      return { dish: d, restaurantName: meta.name, distance: meta.distance };
-    })
-    .sort((a, b) => a.distance - b.distance || a.dish.name.localeCompare(b.dish.name));
-}, [searching, menuItems, restaurantById, query]);
-
-const dishResults = useMemo(() => {
-  if (vegFilter === "all") return dishCandidates;
-  const wantVeg = vegFilter === "veg";
-  return dishCandidates.filter(({ dish }) => dish.is_veg === wantVeg);
-}, [dishCandidates, vegFilter]);
-
-const dishesPending = searching && dishesStatus === "loading";
-const noTextMatches =
-  searching && !dishesPending && restaurantResults.length === 0 && dishCandidates.length === 0;
+interface LocationConfirmModalProps {
+  detectedAddress: string;          // pre-filled (may be "")
+  canSave: boolean;                 // true only for logged-in users
+  busy: boolean;
+  error: string | null;             // geocode/permission copy
+  onConfirm: (args: { address: string; save: boolean; label: AddressLabel; customLabel?: string }) => void;
+  onCancel: () => void;
+}
 ```
 
-### 6.2 Render tree (inside `.rlist__container`)
-Order: `header` → **search bar** → `offer strip` → **results | grid | existing empty states**.
+Body: editable `<textarea>` (autofocused), the optional save checkbox + label chips, the error banner, **Confirm / Cancel** buttons, and the required attribution line:
 
-- **Header:** unchanged; hide the "N nearby" count pill when `searching`.
-- **Search bar:** render when `canSearch`. Anatomy: leading `Search` lucide icon, text input
-  (`onFocus` → `setSearchFocused(true)`), trailing clear `X` (shown when `query !== ""`).
-- **Offer strip:** existing block + `&& !searching`.
-- **Body:**
-  - `!canSearch` → existing branches verbatim (skeleton, fetch error, location error,
-    `NO_RESTAURANTS_CONFIG`, `NONE_IN_RANGE_CONFIG`).
-  - `canSearch && !searching` → existing grid.
-  - `canSearch && searching` → **results view**:
-    - `restaurantResults.length > 0` → **Restaurants** section (title + count). Reuse the existing
-      card by extracting the current `<Link className="rlist__card">…` block into a local
-      `renderCard(entry, idx)` used by both grid and this section (keep `getCardImages`,
-      `RestaurantCardSlideshow`, distance badge, `animationDelay`/`staggerMs`).
-    - **Dishes** area:
-      - `dishesPending && dishCandidates.length === 0` → Dishes header + a small "Searching
-        dishes…" loader (so we never flash "no results" while the fetch is in flight).
-      - else if `dishCandidates.length > 0` → **Dishes** section: header row = title + count
-        (`dishResults`) + **veg chips** (`All`/`Veg`/`Non-veg`, bound to `vegFilter`); body =
-        dish rows (§7), or an inline `No {Veg|Non-veg} dishes match "{query}"` when the toggle
-        empties a non-empty list.
-      - else → nothing (omit Dishes section).
-    - `noTextMatches` → `EmptyState` with `noMatchConfig(query)` (replaces empty sections).
-    - `dishesStatus === "error"` (and no dishes) → optional subtle inline note "Couldn't load
-      dishes — restaurant results still shown."
+```html
+<p class="lcmodal__attribution">Address data © OpenStreetMap contributors</p>
+```
 
-### 6.3 Interactions
-- Clear `X` and **Escape** → `setQuery("")`.
-- No debounce (matching ~hundreds of rows is instant). No autofocus (don't pop the mobile keyboard).
+Default focus is on the textarea (the user usually wants to refine the text immediately), not on a destructive control.
+
+### 4.6 **NEW** `src/lib/addressBook.ts`
+
+Data layer for the saved book (used by Checkout now, and a future Profile manage-screen):
+
+```ts
+import { supabase } from "./supabaseClient";
+import type { DeliveryAddress } from "../types/models";
+
+export async function listAddresses(): Promise<DeliveryAddress[]> { /* select * where user_id=auth.uid() order by is_default desc, updated_at desc */ }
+
+export async function upsertDeliveryAddress(input: {
+  label: "home" | "office" | "other";
+  customLabel?: string | null;
+  addressText: string;
+  lat: number | null;
+  lng: number | null;
+  makeDefault?: boolean;
+}): Promise<void> {
+  // home/office → upsert on (user_id,label) conflict target.
+  // other       → insert (or update by id when editing an existing row).
+}
+
+export async function deleteAddress(id: string): Promise<void> { /* ... */ }
+export async function setDefaultAddress(id: string): Promise<void> { /* clear others, set one */ }
+```
+
+`user_id` is never sent from the client — RLS `WITH CHECK (user_id = auth.uid())` rejects forgery; the insert payload sets `user_id` via a DB default? No — there is no default; the client sets `user_id: (await supabase.auth.getUser()).data.user!.id`, and RLS enforces it equals `auth.uid()`. (Same trust model as `orders_customer_insert`.)
+
+### 4.7 `src/pages/dashboard/utils.ts` — `mapsLink()`
+
+Add alongside `telHref`:
+
+```ts
+export function mapsLink(args: {
+  lat: number | null;
+  lng: number | null;
+  address: string;
+}): string {
+  if (args.lat != null && args.lng != null) {
+    return `https://www.google.com/maps/dir/?api=1&destination=${args.lat},${args.lng}`;
+  }
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(args.address)}`;
+}
+```
+
+Pure → unit-testable (coords path vs text path; encoding).
+
+### 4.8 Dashboard types + selects
+
+- [`types.ts`](../pages/dashboard/types.ts): add `delivery_lat: number | null` and `delivery_lng: number | null` to `PendingOrder` and `ActiveOrder` (not `HistoryOrder` — history is collapsed and shows no address).
+- [`utils.ts`](../pages/dashboard/utils.ts): add `delivery_lat, delivery_lng` to `PENDING_ORDER_SELECT` and `ACTIVE_ORDER_SELECT`.
+
+### 4.9 Owner cards — the Navigate link
+
+In `PendingOrderCard.tsx` and `ActiveOrderCard.tsx`, replace the static address `<p>` with the text plus an anchor:
+
+```tsx
+<p className="pcard__customer-address">📍 {order.delivery_address}</p>
+<a
+  className="pcard__navigate"
+  href={mapsLink({ lat: order.delivery_lat, lng: order.delivery_lng, address: order.delivery_address })}
+  target="_blank"
+  rel="noopener noreferrer"
+>
+  Navigate ▸
+</a>
+```
+
+(`acard__navigate` for the active card.) The link is **always** present — coords give a precise pin, text-only falls back to search. Most valuable on `ActiveOrderCard` when `out_for_delivery`.
+
+### 4.10 `Checkout.tsx` — the orchestration
+
+- New state: `coords`, `savedAddresses`, `selectedAddressId`, `locating`, `geoError`, `confirmGeoOpen`, `detectedAddress`.
+- On mount (logged-in only): `listAddresses()` → render radio list; pre-select the default; fill `address`/`coords` from it.
+- "📍 Use my current location" button (in the Delivery Address section): `setLocating(true)` → `getCurrentPositionOnce()` → `reverseGeocode(coords)` → open `LocationConfirmModal` with `detectedAddress = result?.displayName ?? ""` and the captured `coords` held pending confirm. On geo error, map `kind` → copy and surface inline (keep the textarea usable).
+- Modal `onConfirm`: set `address` + `coords`; if `save`, remember the save intent for post-placement persistence.
+- `handlePlaceOrder`: pass `p_delivery_lat`/`p_delivery_lng` (§3.5); on RPC success and if the user opted to save, call `upsertDeliveryAddress(...)` before `navigate`. A save failure is **non-fatal** — the order already succeeded; surface a soft toast/log, never block the redirect.
+- `canPlace` is unchanged (`address.trim().length > 10`); coords are optional.
+
+### 4.11 (Optional, see §9.3) Profile manage-addresses surface
+
+A small list on `/profile` to rename/delete/set-default saved addresses, using `addressBook.ts`. Not required for the checkout flow to work; can ship as a follow-up. Without it, a user can still overwrite Home/Office by re-saving, and `other` rows accumulate (low harm at v1 volume).
 
 ---
 
-## 7. Dish row markup & styling
+## 5. Security & Privacy
 
-Each dish result is a full-row `<Link to={'/restaurants/' + d.restaurant_id}>`:
-```
-[veg dot]  Dish Name                         ₹Price
-           Restaurant Name · 0.4 km
-```
-- Veg dot: square FSSAI marker — green `#2ECC71` (veg) / red `#E74C3C` (non-veg), matching the
-  `rmenu__veg` treatment in `RestaurantMenu`. `aria-label="Vegetarian" | "Non-vegetarian"`.
-- Price: local `formatPrice(Number(d.price))` (mirror `RestaurantMenu.tsx`; integers → no decimals).
-- Distance: reuse existing `formatDistance(distance)`.
+- **Coordinates are PII.** They are stored in two places: (a) on the order (`delivery_lat/lng`), visible only to the owning restaurant via `orders_owner_select` — necessary for delivery; (b) optionally in the user's own `delivery_addresses` rows, visible only to that user via `delivery_addresses_own_all`. **No cross-user exposure.**
+- **Owners never see the address book** — they read the per-order snapshot. Editing/deleting a saved address can't rewrite history (snapshot doctrine, §3.6).
+- **Third parties receiving coordinates:** Nominatim receives the lat/lng during reverse-geocode (inherent to the feature; documented in the privacy policy update — §7). Google Maps receives the coordinates only when the **owner clicks** the Navigate link, not before.
+- **Consent is explicit twice:** the location button is an opt-in tap; saving is a separate opt-in checkbox. No silent capture, no silent persistence.
+- **Spoofing:** a customer can send arbitrary `delivery_lat/lng` (client metadata). Acceptable — it only affects their own delivery, the CHECK bounds it to the globe, and the owner-decline + phone-verified pipeline (per `location_resilience_plan.md` §3.3) remains the backstop.
+- **Secure-context requirement:** `getCurrentPosition` only works over HTTPS (prod `redlotusfoods.in` ✓) or `localhost`. LAN dev (`http://192.168.x.x:5173`) silently fails — same QA caveat as `location_resilience_plan.md` §7 (use a Vercel preview or a tunnel).
 
 ---
 
-## 8. CSS additions (`RestaurantList.css`, `rlist__` prefix)
+## 6. Edge Cases
 
-Match existing tokens (brand `#D63031`, border `#E8E2DC`, warm bg):
-- `rlist__search`, `rlist__search-input`, `rlist__search-icon`, `rlist__search-clear`.
-- `rlist__results`, `rlist__section`, `rlist__section-head`, `rlist__section-title`,
-  `rlist__section-count`.
-- `rlist__vegfilter`, `rlist__vegchip`, `rlist__vegchip--active`.
-- `rlist__dishes`, `rlist__dish`, `rlist__dish-veg`, `rlist__dish-name`, `rlist__dish-price`,
-  `rlist__dish-sub`.
-- `rlist__results-empty` (veg-filtered note), `rlist__dishes-loading` (in-flight loader).
-
-Responsive: chips wrap under the title `<480px`; reuse `.rlist__grid` for the restaurant section.
-
-**Exact copy strings**
-- Input placeholder & `aria-label`: `Search food or restaurants`
-- Clear `aria-label`: `Clear search`
-- Section titles: `Restaurants`, `Dishes`
-- Veg chips: `All`, `Veg`, `Non-veg`
-- Dishes loader: `Searching dishes…`
-- No-match (`noMatchConfig(query)`): title `No results for "{query}"`; body
-  `Try a shorter or different word — a dish like "biryani" or a place like "Punjab". Still stuck? Chat with us.`;
-  `waMessage`: `Hi RedLotus, I searched for "{query}" but couldn't find it. Can you help me order?`
-  (build dynamically, same pattern as `FETCH_ERROR_CONFIG` spread + `body`).
-- Veg-filtered empty: `No {Veg|Non-veg} dishes match "{query}"`
+| # | Case | Behaviour |
+|---|---|---|
+| 1 | Permission denied on the button | `geoError = "denied"` copy inline; textarea stays usable; no modal. |
+| 2 | GPS timeout (15 s) | `geoError = "timeout"` copy ("move near a window / type it instead"); textarea usable. |
+| 3 | Geolocation unsupported (old browser) | Button hidden or disabled with `unsupported` copy; manual entry only. |
+| 4 | Fix OK, Nominatim down / 5xx / rate-limited | `reverseGeocode` returns `null` → modal opens with an **empty** editable box; pin still captured; user types the landmark. |
+| 5 | Fix OK, Nominatim returns coarse text (village only) | Modal pre-fills the coarse text; user edits to add the house/landmark; pin carries precision. |
+| 6 | User edits text to contradict the pin | We keep the pin (it's where they stood). Modal copy frames the box as "add landmark details to your current location" to reduce mismatch. Owner sees both. |
+| 7 | User types address manually, never taps the button | `coords = null`; order saved with text only; owner gets a Maps **search** link. |
+| 8 | Pre-015 in-flight orders | `delivery_lat/lng IS NULL`; owner card shows the text + search link — unchanged behaviour, no crash. |
+| 9 | Logged-in user picks a saved address | `address`/`coords` filled from the row; if that row had `lat/lng`, owner gets a precise link. |
+| 10 | Save Home when a Home already exists | Partial unique index → `upsert` overwrites the existing Home row. |
+| 11 | Save multiple "Other" addresses | Allowed; distinguished by `custom_label` / `id`. |
+| 12 | Save opted-in but order placement fails | Nothing persisted (save runs only on RPC success, §3.6/§4.10). |
+| 13 | Order succeeds but the address `upsert` fails | Order is already placed; soft toast/log; redirect proceeds. Save is best-effort. |
+| 14 | Double-tap the location button | `locating` flag guards re-entry; one in-flight request at a time (respects Nominatim 1 req/s). |
+| 15 | Offline at checkout | `getCurrentPositionOnce` may still resolve (GPS works offline) but `reverseGeocode` returns `null` → empty box + pin. Placing the order needs connectivity anyway (RPC). |
+| 16 | Anonymous user (not logged in) | Can't reach `/checkout` (auth+phone gate). N/A — but `canSave=false` defensively hides the save UI. |
+| 17 | Sign out | `delivery_addresses` are server-side + RLS-scoped; nothing to clear locally. (Location cache clearing is already handled in `AuthContext.signOut`.) |
 
 ---
 
-## 9. Edge cases & expected behavior
+## 7. Docs to Sync
 
-| Situation | Behavior |
+- **This file** — the design of record.
+- **`CLAUDE.md` + `GEMINI.md`** (keep in lockstep):
+  - `/checkout` routes-table row: note the location button, reverse-geocode confirm modal, `delivery_lat/lng` on the order, and the saved-address picker.
+  - Database section: add the `delivery_addresses` table, the `orders.delivery_lat/lng` columns, and the `place_order` v3 signature (now 9 args, last two optional). Update the "Order placement MUST use `place_order`" note's arg count.
+  - File map: add `src/lib/geolocation.ts`, `src/lib/geocoding.ts`, `src/lib/addressBook.ts`, `LocationConfirmModal`, and `mapsLink` in dashboard utils.
+  - Testing scope: add `geolocation.ts`, `geocoding.ts`, `mapsLink` (and note `locationCache.ts` is already tested — a pre-existing omission in that list).
+- **`v2_deferred_issues.md` §3** — mark the desktop dead-end as further mitigated: address capture is now *preventive* (a pin + editable text), not just the reactive owner-decline net. The remaining v2 gap narrows to "address autocomplete / pincode whitelist for users who can't get any GPS fix at all."
+- **`location_resilience_plan.md` §8** — strike "Saved address book" and "Reverse-geocoded address confirmation" from the v2 list (shipped here); leave map-pin-drop and paid autocomplete deferred.
+- **Privacy policy** (`src/pages/.../PrivacyPolicy`) — disclose that delivery coordinates are collected with consent, stored on the order and (opt-in) in the address book, and shared with OpenStreetMap (reverse geocoding) and Google Maps (owner navigation).
+
+---
+
+## 8. Rollout Sequence
+
+One PR, landed as focused commits (mirrors `location_resilience_plan.md` §7):
+
+1. **Migration 015** — `orders.delivery_lat/lng` + `delivery_addresses` table/RLS/indexes + `place_order` v3. Apply on the Supabase preview branch; **regen `database.ts`**. No frontend behaviour change yet.
+2. **Pure libs + tests** — `geolocation.ts`, `geocoding.ts`, `addressBook.ts`, `mapsLink` in dashboard `utils.ts`; `geolocation.test.ts`, `geocoding.test.ts`, `utils.test.ts` additions. `npm test` green.
+3. **Owner Navigate link** — dashboard `types.ts` + `utils.ts` selects, `PendingOrderCard` + `ActiveOrderCard` anchors. Renders harmlessly on existing orders (NULL coords → search link). Ships value even before the customer side lands.
+4. **Checkout capture** — location button + `LocationConfirmModal` + coords threaded into `place_order`. Manual entry path unchanged.
+5. **Saved address book** — picker, opt-in save, label chips, `upsertDeliveryAddress` on success; (optional) Profile manage UI.
+6. **Docs** — §7 sync across `CLAUDE.md` / `GEMINI.md` / `v2_deferred_issues.md` / `location_resilience_plan.md` / privacy policy.
+
+**QA must run on HTTPS** (Vercel preview or tunnel) — geolocation refuses non-secure LAN origins (`location_resilience_plan.md` §7). **Deploy off-peak** (avoid 12–2 PM and 7–9:30 PM IST).
+
+### 8.1 Manual QA matrix
+
+| Device / state | Expected |
 |---|---|
-| Restaurant/dish in another city (outside radius) | Never fetched (dishes) / never shown (restaurants) — excluded by the 4 km gate |
-| Location resolving / errored / no GPS | No search bar (`canSearch` false); existing states unchanged |
-| `noneInRange` (located, 0 within 4 km) | No search bar; existing `NONE_IN_RANGE_CONFIG` |
-| User searches before dishes load | "Searching dishes…" loader; no premature "no results" |
-| Dish fetch fails | Dishes empty + optional inline note; restaurants + grid still work |
-| Customer moves, nearby set changes | `visibleIdsKey` changes → dishes refetched for the new set; stale rows dropped by `.has()` guard |
-| Query matches restaurants only / dishes only | Show only the relevant section |
-| Veg toggle empties a non-empty dish list | Keep Dishes header + chips + inline "No … dishes match" |
-| Same dish name at 2 restaurants | Two rows, disambiguated by the restaurant-name subline |
-| Whitespace-only query | `searching === false` → grid (not a no-match state) |
-| Open/close & availability changes mid-session | Not reflected until reload — same as today's grid (Realtime out of scope) |
+| Android Chrome, allow location | Fix ≤ 3 s; modal pre-fills OSM text; confirm → coords on order; owner card "Navigate ▸" opens Google directions to the pin. |
+| Android, deny location | `denied` copy; textarea works; order places with text-only search link. |
+| iOS Safari, allow | Same as Android; verify modal focus/scroll-lock behaves like `ConfirmOrderModal`. |
+| Nominatim throttled/offline | Empty modal box + captured pin; user types landmark; order still carries the precise link. |
+| Save Home, then re-save Home with a new pin | Single Home row, overwritten (upsert). |
+| Pick saved address with a pin | Owner gets a precise directions link. |
+| Typed-only order (no button) | Owner gets a Maps text-search link; no crash. |
+| Pre-existing in-flight order | Navigate link = text search; unchanged. |
 
 ---
 
-## 10. Testing
+## 9. Open Questions (need Ankit's sign-off)
 
-### 10.1 Unit — `src/lib/search.test.ts` (Vitest)
-Cover `normalize`, `matchesAllTokens`, `restaurantMatches`, `dishMatches`:
-- empty / whitespace-only query → `false`
-- case-insensitivity (`"PANEER"` vs "Paneer Tikka")
-- partial token (`"bir"` → "Chicken Biryani")
-- multi-token non-contiguous (`"veg rice"` → "Veg Fried Rice")
-- token-AND negative (`"paneer naan"` → "Paneer Tikka Masala" = false)
-- cuisine-only hit (`"chinese"` → Dragon House via `cuisine_type`)
-- description-only hit (`"chinese"` → "Hot & Sour Soup" via description)
-- `null` cuisine / `null` description don't throw and don't match
-
-### 10.2 Manual QA (`npm run dev`, customer login)
-> Local dev uses the **seed** dataset (`supabase/seed.sql`: 5 restaurants / 40 dishes, single
-> village) — production is larger, but behavior is identical. Seed restaurants sit at
-> ~`28.034, 75.789`, outside the `VILLAGE_CENTRE` override; use **Chrome DevTools → Sensors →
-> Location** set to ~`28.035, 75.789` so the 4 km filter yields results, then test.
-
-- **Scoped fetch (the multi-city guarantee):** open the **Network** tab, focus the search box,
-  confirm the `menu_items` request URL contains `restaurant_id=in.(…)` listing only the nearby
-  restaurant ids — i.e. dishes are **not** fetched globally. (Optional: insert one far-away
-  restaurant + dish in a scratch DB and confirm it never appears and is never fetched.)
-- `paneer` → Restaurants 0 (hidden); Dishes 3: Paneer Tikka Masala (Punjab Dhaba), Chilli Paneer
-  (Dragon House), Paneer Makhani Pizza (Pizza Junction). All veg.
-- `paneer` + **Non-veg** → 0 → inline note; **Veg** → 3.
-- `punjab` → Restaurants 1 (Punjab Dhaba); Dishes hidden.
-- `biryani` → Dishes 1 (Chicken Biryani, Punjab Dhaba).
-- `chinese` → Restaurants 1 (Dragon House); Dishes 2 (Hot & Sour Soup, Chicken 65 — via desc).
-- `zzz` → no-match EmptyState. Clear (`X`/Esc) → grid returns; tap a dish → its restaurant menu.
-
-### 10.3 Gates
-`npm test` (new + existing green) · `npm run lint` · `npm run build` (tsc clean).
+1. **Save timing — on modal-confirm vs on order-success?** This plan recommends **on order-success** (don't persist addresses for abandoned orders). The alternative saves the moment the user confirms the modal (survives abandonment, but litters the book). 
+2. **May typed-only addresses (no pin) be saved to the book?** Recommend **yes** — a saved "Office: 2nd floor, market road" with no pin is still useful; owner just gets a text-search link for it.
+3. **Profile manage-addresses UI in this scope or a follow-up?** Recommend **follow-up** (§4.11) — the checkout flow is fully functional without it; re-saving overwrites Home/Office and `other` accumulation is low-harm at v1 volume.
+4. **Auto-pre-select the default address at checkout?** Recommend **yes** (most-recently-used or explicit default), with one tap to switch to "Add new".
+5. **OSM attribution placement** — a small "Address data © OpenStreetMap contributors" line in the confirm modal is the proposed compliance surface. Confirm this is acceptable copy/placement.
+6. **Google Maps as the owner link target** (vs OSM `geo:`/osm.org). Recommend **Google Maps** (ubiquitous on Indian owner phones); trivially swappable in `mapsLink`.
+7. **Directions vs pin for the owner link** — recommend **directions** (`/maps/dir/?...&destination=`) for one-tap navigation when coords exist. Alternative is a dropped pin (`/maps/search/?...&query=lat,lng`) the owner then routes from.
 
 ---
 
-## 11. Performance
+## 10. Summary
 
-- Dish fetch is bounded by the 4 km radius (independent of total catalogue / city count).
-- Client-side matching over a few-hundred-row nearby set is sub-millisecond; all derived values
-  memoised. No debounce / virtualization needed.
-- Lazy fetch (on focus) means browse-only sessions cost zero extra queries.
+Five moving parts, smallest-to-largest:
 
----
+1. **Pin on the order** — `orders.delivery_lat/lng` + `place_order` v3 (additive, optional, no hard break). Owner gets a Google Maps **Navigate ▸** link — the headline value for village delivery.
+2. **One-shot geolocation helper** — `getCurrentPositionOnce` extracted into `src/lib/geolocation.ts` (the `useGeolocation.ts` the requirements assumed didn't exist).
+3. **Reverse geocode** — Nominatim behind `reverseGeocode()`, free + no key, fully editable result, attribution + 1 req/s compliance, degrades to manual entry.
+4. **Confirm modal** — editable address, mirrors `ConfirmOrderModal` mechanics.
+5. **Saved address book** — `delivery_addresses` (one Home, one Office, many Others), opt-in save, RLS customer-only, never exposed to owners.
 
-## 12. Docs to update (structural change — keep mirrors in sync)
-
-- **New:** `src/docs/customer_search_plan.md` (this document).
-- **`CLAUDE.md`:**
-  - `/restaurants` routes-table row → note the inline search (restaurants + dishes, **nearby-scoped
-    dish fetch**, 4 km radius, client-side match, veg/non-veg toggle).
-  - `lib/` file map → add `search.ts  matchesAllTokens()/restaurantMatches()/dishMatches() — customer search filtering`.
-  - Testing scope line → add `src/lib/search.ts`.
-- **`GEMINI.md`:** mirror the same edits.
-
----
-
-## 13. Files touched
-
-| Action | Path |
-|---|---|
-| New | `src/lib/search.ts`, `src/lib/search.test.ts`, `src/docs/customer_search_plan.md` |
-| Edit | `src/pages/restaurants/RestaurantList.tsx`, `src/pages/restaurants/RestaurantList.css` |
-| Edit | `CLAUDE.md`, `GEMINI.md` |
-
-No migration · no RPC · no new route · no navbar change · no `RestaurantMenu` change.
-
----
-
-## 14. Out of scope (possible follow-ups)
-
-- **Server-side search RPC** — only if a single 4 km radius ever holds many thousands of dishes.
-- **Geo-scope the restaurant fetch** (lat/lng bounding box) when cross-city restaurant counts grow
-  large; pairs naturally with the scoped dish fetch.
-- **Per-city / configurable radius** instead of the fixed 4 km `RADIUS_KM`.
-- Deep-link + scroll/highlight to the tapped dish; typo tolerance / synonyms; recent searches;
-  search analytics; live (Realtime) availability in results.
+No new paid dependency, no API key, one migration, ~3 small libs + 1 modal + targeted edits to Checkout and the two owner cards. Closes two long-standing v2 deferrals and gives riders an actual map pin instead of "behind the temple."
