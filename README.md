@@ -1,6 +1,6 @@
 # Customer UI Revamp — Discovery Home Build Plan
 
-> **Status:** Proposed (not yet implemented)
+> **Status:** Proposed (not yet implemented). **Confirmed 2026-06-23 — D1: anonymous browsing · D2: discovery replaces `/` · D4: promo video supported.** D3/D5/D6 on recommended defaults pending sign-off. **Build paused for Ankit's doc review.**
 > **Author:** Ankit
 > **Goal:** Replace the static marketing landing as the customer's first screen with a **Zomato/Swiggy-style discovery home** — a top address bar + profile, a 1:1 offers/announcements media tile (image *or* video) from the database, a food-category rail (Thali / Pizza / Chinese …), a featured-restaurants rail, and the existing nearby-restaurants grid — so a visitor lands in *food browsing*, not a brochure.
 >
@@ -12,7 +12,7 @@
 > - **New `promotions` table + `promotion-media` storage bucket** → the 1:1 offers/announcements carousel (image **or** muted-loop video).
 > - **New `menu_categories` table** → the "What's on your mind?" cuisine rail; tapping a chip filters via the existing `src/lib/search.ts` matcher.
 > - **New `restaurants.is_featured` + `featured_rank`** → a real, admin-curated featured rail (replaces the hardcoded fake list).
-> - **Optional but recommended: anonymous browsing** (a new public-read RLS path) so a *logged-out* visitor can browse before being asked to sign in at checkout — the literal "new user lands on the restaurant page" ask.
+> - **Decided (2026-06-23): anonymous browsing** — a new public-read RLS path so a *logged-out* visitor can browse before being asked to sign in at checkout (the literal "new user lands on the restaurant page" ask). Cost: the §4.1 public-read migration + anon cart persistence (§5.8).
 
 ---
 
@@ -83,7 +83,7 @@ This table is the spine of the "match the database" rule. Build nothing that isn
 | 11 | Restaurant card media | `restaurants.image_urls` → `image_url` → placeholder (`getCardImages`) | None |
 | 12 | Card distance chip | haversine(`userCoords`, `restaurant.lat/lng`) | None |
 | 13 | Veg/non-veg dish dots | `menu_items.is_veg` | None |
-| 14 | Cart bar | `CartContext` (`itemCount`, `pricing`) | None (anon needs persistence, §4.7) |
+| 14 | Cart bar | `CartContext` (`itemCount`, `pricing`) | None (anon needs persistence, §5.8) |
 
 ### 2.1 What we deliberately omit (no backing data)
 
@@ -102,14 +102,14 @@ Stated explicitly so a future contributor doesn't "add it to match Zomato":
 
 | # | Decision | Options | **Recommendation** | Blast radius |
 |---|---|---|---|---|
-| **D1** | Who sees discovery? | (A) Anonymous browse + auth-at-checkout · (B) Auth-gated, discovery is post-login home | **(A) Anonymous** — it's the literal brief and the better funnel; cost is one careful public-read migration (§4.1) + anon cart persistence (§4.7) | High — sets RLS + routing |
-| **D2** | What is the index route `/`? | (A) Discovery for everyone · (B) Keep marketing landing, redirect authed customers to discovery | **(A)** Discovery becomes `/`; marketing content relocates to `/partner-program` + `/about` (owner-acquisition keeps a home) | High — routing |
+| **D1** ✅ | Who sees discovery? | (A) Anonymous browse + auth-at-checkout · (B) Auth-gated, discovery is post-login home | **CONFIRMED (2026-06-23): (A) Anonymous** — the literal brief and the better funnel; cost is the public-read migration (§4.1) + anon cart persistence (§5.8) | High — sets RLS + routing |
+| **D2** ✅ | What is the index route `/`? | (A) Discovery for everyone · (B) Keep marketing landing, redirect authed customers to discovery | **CONFIRMED (2026-06-23): (A)** — Discovery becomes `/`; marketing content relocates to `/partner-program` + `/about` (owner-acquisition keeps a home) | High — routing |
 | **D3** | Category backing | (A) `menu_categories` table with `match_keywords[]` (curated chips, keyword filter) · (B) full `restaurant_categories` join (tag every restaurant) · (C) derive from `cuisine_type` only | **(A)** — real, admin-curated chips; deterministic keyword match; no per-restaurant tagging chore at 5-restaurant scale. Upgrade to (B) in v2 if needed | Medium |
 | **D4** | Promo media | (A) image **and** video (mp4) · (B) image only | **(A)** — brief explicitly says "play video or images". Video = muted, looped, `playsinline`, ≤ a few MB | Medium |
 | **D5** | Show closed restaurants greyed? | (A) No (open-only, current RLS) · (B) Yes (relax RLS to `is_active`, grey client-side) | **(A)** for v1 | Low–Medium |
 | **D6** | Featured curation | (A) Manual `is_featured` + `featured_rank` (admin) · (B) Auto (nearest/newest) | **(A)** — predictable, admin-controlled; falls back to nearest when none flagged | Low |
 
-Everything below assumes the recommended path (A/A/A/A/A/A). §3.7 documents the auth-gated (D1-B) variant so the rest of the doc stays decision-independent — **the components are identical; only routing + RLS differ.**
+Everything below assumes the recommended path (A/A/A/A/A/A). **D1 confirmed (A — anonymous)** and **D2 confirmed (A — discovery replaces `/`)**; D4 is settled by the brief ("play video or images") → (A); D3/D5/D6 await final sign-off but build on the recommended defaults. §3.7 documents the auth-gated (D1-B) variant — now moot — for the record; the rest of the doc is decision-independent (**components are identical; only routing + RLS differ**).
 
 ### 3.2 Information architecture
 
@@ -536,8 +536,8 @@ Each phase is shippable: 1–4 add capability behind the unchanged `/`; only pha
 
 ## 10. Open Questions (need Ankit's sign-off)
 
-1. **D1 — anonymous browsing?** Recommend **yes (A)**: it's the literal brief and the better funnel. Cost = the `016` public-read migration + cart persistence (§5.8). If you'd rather keep login-first for now, we take D1-B and skip both (§3.7).
-2. **D2 — does `/` become discovery for everyone, retiring the marketing landing there?** Recommend **yes**; owner-acquisition content lives on `/partner-program` + `/about`. Confirm you're OK losing the brochure as the literal homepage (it stays reachable, just not at `/`).
+1. **D1 — anonymous browsing?** ✅ **CONFIRMED (2026-06-23): yes (A).** The `016` public-read migration + anon cart persistence (§5.8) are in scope. (D1-B / §3.7 no longer applies.)
+2. **D2 — does `/` become discovery for everyone?** ✅ **CONFIRMED (2026-06-23): yes (A).** Marketing content relocates to `/partner-program` + `/about`; the brochure stays reachable, just not at `/`.
 3. **D3 — category backing:** keyword-matched `menu_categories` (recommended) vs a full `restaurant_categories` join. Confirm keyword matching is acceptable for launch.
 4. **D4 — promo video:** confirm we support MP4 (muted, looped, ≤5 MB) and not image-only. Affects the bucket mime list + `<video>` component.
 5. **D5 — show closed restaurants greyed?** Recommend **no** for v1 (RLS already hides them). Flipping later needs an RLS relax + client grey-out.
@@ -549,4 +549,4 @@ Each phase is shippable: 1–4 add capability behind the unchanged `/`; only pha
 
 ## 11. Summary
 
-The discovery home is **composition over invention**: it reuses the geolocation engine, restaurant cards, search matcher, cart, and offer copy that already exist, and adds a top bar + three rails on top. The work that's genuinely *new* is four small, convention-following backend pieces — **anon read access, a `promotions` media table + bucket, a `menu_categories` chip table, and an `is_featured` flag** — because the brief's "match the database" rule means we make the data real rather than fake the UI (and we delete the fabricated `FeaturedRestaurants` to honour it). The single load-bearing decision is **D1 (anonymous browsing)**; everything else is additive and the components are identical either way.
+The discovery home is **composition over invention**: it reuses the geolocation engine, restaurant cards, search matcher, cart, and offer copy that already exist, and adds a top bar + three rails on top. The work that's genuinely *new* is four small, convention-following backend pieces — **anon read access, a `promotions` media table + bucket, a `menu_categories` chip table, and an `is_featured` flag** — because the brief's "match the database" rule means we make the data real rather than fake the UI (and we delete the fabricated `FeaturedRestaurants` to honour it). The load-bearing decision **D1 is settled — anonymous browsing (A)** — so the `016` public-read migration + anon cart persistence are in scope; everything else is additive and component-identical.
